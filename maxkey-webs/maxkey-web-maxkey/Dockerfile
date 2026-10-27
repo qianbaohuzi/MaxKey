@@ -1,4 +1,4 @@
-FROM eclipse-temurin:21-jdk-alpine
+FROM docker.io/library/eclipse-temurin:21-jdk-alpine
 
 LABEL authors="MaxKey <support@maxsso.net>"
 
@@ -14,4 +14,4 @@ EXPOSE 9527
 
 ENV TZ=Asia/Shanghai JAVA_OPTS="-Xms256m -Xmx2048m -Djava.security.egd=file:/dev/./urandom"
 
-CMD sleep 60; java -jar maxkey-boot.jar $JAVA_OPTS
+CMD sleep 60; java $JAVA_OPTS -jar maxkey-boot.jar

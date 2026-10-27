@@ -18,11 +18,13 @@ export JAVA_LIBPATH
 export JAVA_LIBMAXKEYPATH
 
 
-for LL in `ls $JAVA_LIBMAXKEYPATH/*.jar`
-        do
-                JAVA_CLASSPATH=$LL
-               
-done
+# 定位可执行 jar（优先 bootJar 产物，避免多 jar 时取错）
+JAVA_CLASSPATH=$(ls -1 $JAVA_LIBMAXKEYPATH/maxkey-boot-*.jar 2>/dev/null | head -1)
+[ -z "$JAVA_CLASSPATH" ] && JAVA_CLASSPATH=$(ls -1 $JAVA_LIBMAXKEYPATH/*.jar 2>/dev/null | head -1)
+if [ -z "$JAVA_CLASSPATH" ]; then
+        echo "ERROR: no jar found under $JAVA_LIBMAXKEYPATH"
+        exit 1
+fi
 
 export JAVA_CLASSPATH
 # Display our environment
@@ -38,6 +40,9 @@ ${JAVA_EXEC} -version
 echo ""
 echo "-------------------------------------------------------------------------------"
 echo ""
+
+# 日志目录不存在时重定向会失败，进程根本起不来
+mkdir -p ./logs
 
 nohup $JAVA_EXEC -jar $JAVA_OPTS $JAVA_CLASSPATH >./logs/nohup_maxkey.out 2>&1 &
 

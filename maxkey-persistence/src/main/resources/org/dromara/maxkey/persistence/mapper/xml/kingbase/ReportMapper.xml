@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.maxkey.persistence.mapper.ReportMapper" >
+ 	<!-- DAY  COUNT 一天访问量 -->
+	<select id="analysisDayCount" parameterType="InstDto" resultType="Integer">
+    	select 
+    		count(id) reportcount
+    	from mxk_history_login 
+    	where  instid   =   #{instId} 
+            and logintime::date = current_date
+    </select>
+    
+    <!-- MONTH COUNT 一个月访问量 -->
+    <select id="analysisMonthCount" parameterType="InstDto" resultType="Integer">
+    	select 
+    		count(id) reportcount
+    	from mxk_history_login 
+    	where  instid   =   #{instId} 
+    		and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+    </select>
+    
+    <!-- 本月新用户统计 -->
+    <select id="analysisNewUsers" parameterType="InstDto" resultType="Integer">
+    	select 
+			count(*) reportcount 
+		from mxk_userinfo 
+		where instid   =   #{instId} 
+		  and date_trunc('month', createddate) = date_trunc('month', current_date)
+    </select>
+    <!-- 在线用户统计 -->
+    <select id="analysisOnlineUsers" parameterType="InstDto" resultType="Integer">
+    	    select count(*) reportcount
+        from mxk_history_login
+        where instid = #{instId}
+          and sessionstatus = 1
+    </select>
+    <!-- 30天活跃用户统计 -->
+    <select id="analysisActiveUsers" parameterType="InstDto" resultType="Integer">
+    	select 
+			count(*) reportcount 
+		from mxk_userinfo 
+		where instid   =   #{instId} 
+		  and lastlogintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+    </select>
+    
+    <!-- DAY HOUR COUNT 当天每小时 -->
+	<select id="analysisDayHour" parameterType="InstDto" resultType="Map">
+        select h.reportstring reportstring, coalesce(c.reportcount, 0) reportcount from (
+            select 0  reportstring union all 
+            select 1  reportstring union all 
+            select 2  reportstring union all 
+            select 3  reportstring union all 
+            select 4  reportstring union all 
+            select 5  reportstring union all 
+            select 6  reportstring union all 
+            select 7  reportstring union all 
+            select 8  reportstring union all 
+            select 9  reportstring union all 
+            select 10 reportstring union all 
+            select 11 reportstring union all 
+            select 12 reportstring union all 
+            select 13 reportstring union all 
+            select 14 reportstring union all 
+            select 15 reportstring union all 
+            select 16 reportstring union all 
+            select 17 reportstring union all 
+            select 18 reportstring union all 
+            select 19 reportstring union all 
+            select 20 reportstring union all 
+            select 21 reportstring union all 
+            select 22 reportstring union all 
+            select 23 reportstring
+        ) h left join(
+            select count(id) reportcount, extract(hour from logintime)::int reportstring 
+            from mxk_history_login 
+            where instid = #{instId} and logintime::date = current_date 
+            group by reportstring
+        )c  on h.reportstring=c.reportstring
+    	order by h.reportstring
+    </select>
+    
+    <!-- 30 DAY COUNT 最近30天每天访问量-->   
+    <select id="analysisMonth" parameterType="InstDto" resultType="Map">
+    	select 
+    		count(id) reportcount, 
+			to_char(logintime, 'YYYY-MM-DD') reportstring 
+    	from mxk_history_login 
+    	where   instid   =   #{instId} 
+    		and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+    	group by reportstring
+    	order by reportstring
+    </select>
+    
+    <!-- 30天浏览器的访问统计 -->
+    <select id="analysisBrowser" parameterType="InstDto" resultType="Map">
+    	select 
+    		count(id) reportcount, 
+			coalesce(browser,'Other') reportstring 
+    	from mxk_history_login 
+    	where  instid   =   #{instId} 
+            and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+    	group by reportstring
+    	order by reportcount desc
+    	limit 10
+    </select>
+    
+    <!-- 30天应用单点登录的访问统计 -->
+	<select id="analysisApp" parameterType="InstDto" resultType="Map">
+    	select 
+			count(id) reportcount,
+			appname 
+    	from mxk_history_login_apps
+    	where  instid   =   #{instId} 
+    	   and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+    	group by appname order by reportcount desc
+    	limit 10
+    </select>
+    
+    <!-- 30天各省份的访问统计 -->
+	<select id="analysisProvince" parameterType="InstDto" resultType="Map">
+		select
+			count(id) as reportcount,
+			coalesce(province,'Other') as reportstring
+		from mxk_history_login
+		where  instid   =   #{instId}
+		  and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+		  and province !=''
+		group by reportstring
+		order by reportcount desc
+			limit 1000
+	</select>
+	
+	<select id="analysisCountry" parameterType="InstDto" resultType="Map">
+		select
+			count(id) as reportcount,
+			coalesce(country,'Other') as reportstring
+		from mxk_history_login
+		where  instid   =   #{instId}
+		  and logintime::date > (current_date - (extract(day from current_date) + 31) * interval '1 day')
+		  and country !=''
+		group by reportstring
+		order by reportcount desc
+			limit 1000
+	</select>
+	
+	    <!-- 用户统计 -->
+    <select id="totalUsers" parameterType="InstDto" resultType="Integer">
+            select 
+                count(*) reportcount 
+            from mxk_userinfo 
+            where   instid   =   #{instId} 
+                and status = 1
+    </select>
+    
+    <!-- 部门统计 -->
+    <select id="totalDepts" parameterType="InstDto" resultType="Integer">
+            select 
+                count(*) reportcount 
+            from mxk_organizations 
+            where   instid   =   #{instId} 
+                and status = 1
+    </select>
+    
+    <!-- 应用统计 -->
+    <select id="totalApps" parameterType="InstDto" resultType="Integer">
+            select 
+                count(*) reportcount 
+            from mxk_apps 
+            where   instid   =   #{instId} 
+                and status = 1
+    </select>
+    
+    <!-- 部门统计 -->
+    <select id="totalGroups" parameterType="InstDto" resultType="Integer">
+            select 
+                count(*) reportcount 
+            from mxk_groups 
+            where   instid   =   #{instId} 
+                and status = 1
+    </select>
+
+</mapper>
