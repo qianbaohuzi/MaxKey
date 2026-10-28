@@ -37,7 +37,7 @@ REPO=$(cd "${HERE}/../.." && pwd)
 # 用 awk '{print $3}' 会取到空串，这里按 = 号切更稳
 VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' "${REPO}/gradle.properties" | head -1 | tr -d ' \r')
 [ -n "$VERSION" ] || { echo "ERROR: 无法从 gradle.properties 解析 version"; exit 1; }
-PKG_NAME="maxkey-kylin-${VERSION}"
+PKG_NAME="maxkey-deploy-${VERSION}"
 OUT="${REPO}/build/${PKG_NAME}"
 
 DO_BUILD=0
@@ -62,12 +62,31 @@ MGT_DIST="${REPO}/maxkey-web-frontend/maxkey-web-mgt-ng/dist/browser"
 
 if [ "$DO_BUILD" = "1" ]; then
     say "构建后端 (gradle bootJar)"
-    ( cd "$REPO" && ./gradlew :maxkey-webs:maxkey-web-maxkey:bootJar :maxkey-webs:maxkey-web-mgt:bootJar -x test )
+    # GRADLE_EXTRA_ARGS 用于受限环境，例如：
+    #   GRADLE_EXTRA_ARGS="--offline"        # 依赖已在本地缓存，不联网
+    # 以及 GRADLE_USER_HOME 指向可写的缓存目录（$HOME 不可写时必需）
+    # shellcheck disable=SC2086
+    ( cd "$REPO" && ./gradlew :maxkey-webs:maxkey-web-maxkey:bootJar \
+        :maxkey-webs:maxkey-web-mgt:bootJar -x test ${GRADLE_EXTRA_ARGS:-} )
 
-    say "构建前端 (需要 node 22 + pnpm)"
-    command -v pnpm >/dev/null || { echo "ERROR: 未安装 pnpm"; exit 1; }
-    ( cd "${REPO}/maxkey-web-frontend/maxkey-web-ng"     && pnpm install --frozen-lockfile && pnpm run build:prod )
-    ( cd "${REPO}/maxkey-web-frontend/maxkey-web-mgt-ng" && pnpm install --frozen-lockfile && pnpm run build:prod )
+    say "构建前端 (node 22.23.2 + pnpm，锁文件固定)"
+    # 版本口径必须一致，否则依赖解析会漂。这里对 lockfile 做硬校验：
+    # 缺少 pnpm-lock.yaml 就无法 --frozen-lockfile，构建不可复现，直接报错。
+    #
+    # corepack 在 $HOME 不可写时会失败（EACCES mkdir ~/.cache/node/corepack），
+    # 故允许用 COREPACK_HOME 指向可写目录、COREPACK_CMD 指定调用方式。
+    for d in maxkey-web-ng maxkey-web-mgt-ng; do
+        fdir="${REPO}/maxkey-web-frontend/${d}"
+        [ -f "${fdir}/pnpm-lock.yaml" ] || {
+            echo "ERROR: 缺少 ${fdir}/pnpm-lock.yaml"
+            echo "       该文件必须入库，否则构建不可复现。"
+            echo "       修复: cd ${fdir} && pnpm install --lockfile-only"
+            exit 1
+        }
+        ( cd "$fdir" && ${COREPACK_CMD:-pnpm} install --frozen-lockfile && \
+          NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8000}" \
+          ${COREPACK_CMD:-pnpm} run build:prod )
+    done
 
     PORTAL_JAR=$(ls -1 "${REPO}"/maxkey-webs/maxkey-web-maxkey/build/libs/maxkey-boot-*ga.jar 2>/dev/null | head -1 || true)
     MGT_JAR=$(ls -1 "${REPO}"/maxkey-webs/maxkey-web-mgt/build/libs/maxkey-mgt-boot-*ga.jar 2>/dev/null | head -1 || true)
@@ -99,12 +118,26 @@ cp -a "${MGT_DIST}/."    "$OUT/web/maxkey-mgt/"
 cp "${HERE}/bin/maxkeyctl.sh"    "$OUT/bin/"
 cp "${HERE}/bin/make-runtime.sh" "$OUT/bin/"
 cp "${HERE}/bin/preflight.sh"    "$OUT/bin/"
+# 安装/卸载脚本放在包根目录，随包分发
+cp "${HERE}/install.sh"          "$OUT/"
+cp "${HERE}/uninstall.sh"        "$OUT/"
 cp "${HERE}/conf/maxkey.env"     "$OUT/conf/"
 # 口令密钥模板：运维据此创建 /etc/maxkey/maxkey-secret.env
 cp "${HERE}/conf/maxkey-secret.env.example" "$OUT/conf/" 2>/dev/null || true
 cp "${HERE}/nginx/"*.conf        "$OUT/nginx/"
 cp "${HERE}/systemd/"*.service   "$OUT/systemd/"
-cp "${REPO}/sql/kingbase/maxkey.sql"        "$OUT/sql/"
+# 建库脚本用「最小种子」版：表结构 44 张全保留，只裁掉演示历史/头像/图标。
+# 实测从 18.9MB 降到 0.4MB，登录与 SSO 所需数据（admin 账号、机构、用户组、
+# 菜单权限、OAuth client 注册信息、SAML 证书）全部在内。
+# 生成方式见 sql/kingbase/make-seed.py（--verify 可自检）。
+SEED_SQL="${REPO}/sql/kingbase/maxkey-seed.sql"
+if [ ! -f "$SEED_SQL" ]; then
+    say "生成最小种子建库脚本"
+    python3 "${REPO}/sql/kingbase/make-seed.py" --verify >/dev/null || {
+        echo "ERROR: 生成 ${SEED_SQL} 失败，请检查 sql/kingbase/make-seed.py"; exit 1; }
+fi
+cp "$SEED_SQL" "$OUT/sql/"
+cp "${REPO}/sql/kingbase/make-seed.py"          "$OUT/sql/" 2>/dev/null || true
 cp "${REPO}/sql/kingbase/convert_from_mysql.py" "$OUT/sql/" 2>/dev/null || true
 
 chmod +x "$OUT/bin/"*.sh
@@ -143,11 +176,16 @@ echo "完成:"
 echo "  目录: ${OUT}"
 echo "  压缩包: $(dirname "$OUT")/${PKG_NAME}.tar.gz  ($(du -h "$(dirname "$OUT")/${PKG_NAME}.tar.gz" | cut -f1))"
 echo
-echo "部署到麒麟（统一装到 /opt/maxkey，systemd 单元按此路径写死）:"
-echo "  tar xzf ${PKG_NAME}.tar.gz -C /opt"
-echo "  mv /opt/${PKG_NAME} /opt/maxkey"
-echo "  vi /opt/maxkey/conf/maxkey.env"
-echo "  /opt/maxkey/bin/maxkeyctl.sh start"
+echo "部署到目标机（统一装到 /opt/maxkey，systemd 单元按此路径写死）:"
 echo
-echo "若必须保留版本号目录，则需同步修改 systemd/*.service 里的"
-echo "PIDFile / ExecStart / ReadWritePaths 与 EnvironmentFile 路径。"
+echo "  tar xzf ${PKG_NAME}.tar.gz"
+echo "  cd ${PKG_NAME}"
+echo "  vi conf/maxkey.env           # 改 MAXKEY_PUBLIC_URL / SERVER_DOMAIN / NGINX_* 与数据库"
+echo "  sudo ./install.sh --dry-run  # 先演练，确认将要做的事"
+echo "  sudo ./install.sh            # 真正落盘（文件/systemd/nginx 配置）"
+echo "  sudo vi /etc/maxkey/maxkey-secret.env   # 填数据库口令，600 root:root"
+echo "  sudo ./bin/preflight.sh      # 环境自检"
+echo "  sudo ./bin/maxkeyctl.sh start"
+echo
+echo "卸载: sudo ./uninstall.sh          （保留配置与数据）"
+echo "      sudo ./uninstall.sh --purge  （连程序目录一起删，数据库不动）"

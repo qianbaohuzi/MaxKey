@@ -50,10 +50,51 @@ fi
 : "${MAXKEY_SCHEME:=http}"
 export MAXKEY_SCHEME
 export SERVER_DOMAIN="${SERVER_DOMAIN:-}"
+export MAXKEY_PUBLIC_URL="${MAXKEY_PUBLIC_URL:-}"
+
+# 公开访问地址（MAXKEY_PUBLIC_URL）的处理，这是整套配置里最容易搞错的一环。
+#
+# 后端有两处需要"对外地址"，但取法完全不同：
+#   (a) JWT 的 iss（maxkey.auth.jwt.issuer ← maxkey.server.uri）
+#       签发与校验用同一个固定值，JwtLoginService 对 iss 做【严格相等】比对。
+#       所以它绝不能用请求头推导 —— 否则同一实例经不同入口访问会签出不同 iss，
+#       token 互不认，表现为"登录成功但立刻失效"。
+#   (b) OIDC 元数据的 issuer / authorization_endpoint 等
+#       由 WebContext.getContextPath(true) 从【当前请求】推导，
+#       依赖 server.forward-headers-strategy=NATIVE 读 X-Forwarded-*。
+#
+# 脚本只负责把 (a) 下发给 JVM；(b) 由 nginx 传头 + 后端开关解决。
+#
+# 未配置时回退到 scheme://sso.$SERVER_DOMAIN（与历史行为一致，保证能起来）；
+# 但走 nginx 反代且对外端口非默认端口时，必须显式配置。
+if [ -z "$MAXKEY_PUBLIC_URL" ]; then
+    if [ -n "${SERVER_DOMAIN:-}" ]; then
+        MAXKEY_PUBLIC_URL="${MAXKEY_SCHEME}://sso.${SERVER_DOMAIN}"
+        echo "WARN: 未配置 MAXKEY_PUBLIC_URL，按 SERVER_DOMAIN 推导为 ${MAXKEY_PUBLIC_URL}"
+        echo "      若对外端口不是 ${MAXKEY_SCHEME} 的默认端口，请显式配置，例如"
+        echo "      MAXKEY_PUBLIC_URL='${MAXKEY_SCHEME}://sso.${SERVER_DOMAIN}:9443'"
+    fi
+fi
+export MAXKEY_PUBLIC_URL
 
 # maxkey.server.scheme 在 properties 中是写死的 http，无法用环境变量覆盖，
 # 故启动时用 -D 显式下发（-D 优先级高于 application.properties）
 SPRING_EXTRA_OPTS="-Dmaxkey.server.scheme=${MAXKEY_SCHEME}"
+# 公开地址同样用 -D 兜底下发：环境变量已能生效，-D 只是双保险，
+# 避免 systemd 的 EnvironmentFile 与手工 source 两条路径行为不一致。
+[ -n "$MAXKEY_PUBLIC_URL" ] && SPRING_EXTRA_OPTS="${SPRING_EXTRA_OPTS} -DMAXKEY_PUBLIC_URL=${MAXKEY_PUBLIC_URL}"
+
+# ------------------------------------------------ 配置一致性检查 ----
+# MAXKEY_PUBLIC_URL 与 SERVER_DOMAIN 必须指向同一个主机。
+# 不一致时典型症状：能登录，但 SSO 回跳到另一个域名/端口，浏览器侧 404。
+if [ -n "${MAXKEY_PUBLIC_URL:-}" ] && [ -n "${SERVER_DOMAIN:-}" ]; then
+    pub_host=$(echo "$MAXKEY_PUBLIC_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
+    if [ "$pub_host" != "sso.${SERVER_DOMAIN}" ]; then
+        echo "WARN: MAXKEY_PUBLIC_URL 的主机 (${pub_host}) 与 SERVER_DOMAIN 推导的"
+        echo "      (sso.${SERVER_DOMAIN}) 不一致。"
+        echo "      域名同时用于①租户识别 ②SSO 回跳地址 ③Cookie 域，不一致会导致回跳失败。"
+    fi
+fi
 
 # ------------------------------------------------------- 配置自检（关键） ----
 # bash 对 `A=x&y` 不报语法错误，而是把 & 当后台分隔符，A 变成空串、
@@ -102,15 +143,33 @@ java_major() {
 
 find_java() {
     local cand major
-    # 1) 显式指定（systemd / 环境变量）
+    # 探测顺序是刻意的，不要随意调换：
+    #   0) MAXKEY_JAVA 显式强制
+    #   1) 发布包内置运行时（jlink 裁剪结果）
+    #   2) 显式指定的 JAVA_HOME
+    #   3) 系统已装的 JDK 21
+    #   4) PATH 中的 java
+    #
+    # 为什么内置运行时排第一：本方案要解决的问题正是"目标机器的 Java 版本不可控"。
+    # 若让 JAVA_HOME / PATH 优先，目标机上一个残缺的 JDK 会把内置运行时顶掉，
+    # 打包内置 JDK 的努力全部作废，且失败现象变成难以归因的
+    # UnsupportedClassVersionError 或各类 NoClassDefFoundError。
+    # 需要强制用外部 JDK 时，显式传 MAXKEY_JAVA 或删掉 jre/ 目录。
+    if [ -n "${MAXKEY_JAVA:-}" ]; then
+        if [ -x "$MAXKEY_JAVA" ]; then
+            echo "$MAXKEY_JAVA"; return 0
+        fi
+        echo "WARN: MAXKEY_JAVA=${MAXKEY_JAVA} 不存在或不可执行，忽略" >&2
+    fi
+    # 1) 发布包内置运行时
+    if [ -x "${BASE_DIR}/jre/bin/java" ]; then echo "${BASE_DIR}/jre/bin/java"; return 0; fi
+    # 2) 显式指定的 JAVA_HOME
     if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
         cand="${JAVA_HOME}/bin/java"
         major=$(java_major "$cand")
         if [ "$major" -ge 21 ] 2>/dev/null; then echo "$cand"; return 0; fi
         echo "WARN: JAVA_HOME=${JAVA_HOME} 为 JDK ${major}，低于 21，继续探测" >&2
     fi
-    # 2) 发布包内置运行时（jlink 裁剪结果）
-    if [ -x "${BASE_DIR}/jre/bin/java" ]; then echo "${BASE_DIR}/jre/bin/java"; return 0; fi
     # 3) 系统已装 JDK
     for dir in /usr/lib/jvm/*21* /usr/lib/jvm/*-21-* /opt/jdk-21* /usr/java/jdk-21*; do
         [ -x "${dir}/bin/java" ] || continue
@@ -124,6 +183,105 @@ find_java() {
         major=$(java_major "$cand")
         if [ "$major" -ge 21 ] 2>/dev/null; then echo "$cand"; return 0; fi
     fi
+    return 1
+}
+
+# --------------------------------------------------------- 运行时自检 ----
+# jlink 裁剪运行时的兜底检查。
+#
+# 为什么需要它：裁剪后的运行时如果缺模块，报错形式是 ClassNotFoundException /
+# NoClassDefFoundError，堆栈很深且指向的往往不是真正的缺失点。现场看到
+# "NoClassDefFoundError: java/beans/PropertyChangeEvent" 时，几乎没人能立刻
+# 想到"缺 java.desktop"。实测这个异常只在渲染验证码时才触发 —— 也就是说
+# 服务已经启动成功、运维以为没事了，等用户第一次打开登录页才炸。
+#
+# 所以这里在启动前主动探测，缺模块时立刻停下并指名道姓说缺什么。
+#
+# 实现注意：**不能用 `java Probe.java` 单文件源码模式**。
+# 那种模式依赖 jdk.compiler，而按设计裁剪掉的运行时正好没有它，
+# 会先报 "Module jdk.compiler not in boot Layer"，把真正缺的模块信息盖掉。
+# 所以用 javac 预编译成 .class，再用 -cp 运行。
+runtime_selfcheck() {
+    local jvm=$1
+    local probe_dir javac_bin out rc=0
+
+    # 系统 JDK（非 jlink 产物）模块齐全，不必探测。
+    case "$jvm" in
+        "${BASE_DIR}/jre/bin/java") ;;
+        *) return 0 ;;
+    esac
+
+    probe_dir=$(mktemp -d 2>/dev/null) || return 0
+
+    # 编译用的 javac：裁剪运行时通常没有，需借外部 JDK。
+    javac_bin=""
+    for c in "${BASE_DIR}/jre/bin/javac" "$(dirname "$jvm")/javac" "$(command -v javac 2>/dev/null)"; do
+        [ -n "$c" ] && [ -x "$c" ] && { javac_bin="$c"; break; }
+    done
+
+    cat > "${probe_dir}/Probe.java" <<'PROBE_EOF'
+import java.awt.image.BufferedImage;
+import java.util.prefs.Preferences;
+
+public class Probe {
+    public static void main(String[] a) throws Exception {
+        new BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB).getGraphics(); // java.desktop
+        Class.forName("java.sql.Driver");                                   // java.sql
+        Class.forName("javax.naming.Context");                              // java.naming
+        Class.forName("java.lang.management.ManagementFactory");            // java.management
+        Class.forName("org.ietf.jgss.GSSManager");                          // jgss
+        Preferences.userRoot();                                             // java.prefs
+        System.out.println("RUNTIME_OK");
+    }
+}
+PROBE_EOF
+
+    if [ -z "$javac_bin" ]; then
+        echo "WARN: 找不到 javac，跳过内置运行时自检"
+        echo "      如需启用自检，请安装任意 JDK 或保证 jre/bin/javac 存在"
+        rm -rf "$probe_dir"
+        return 0
+    fi
+
+    if ! "$javac_bin" -d "$probe_dir" "${probe_dir}/Probe.java" >"${probe_dir}/javac.log" 2>&1; then
+        echo "WARN: 自检代码编译失败，跳过运行时自检:"
+        head -3 "${probe_dir}/javac.log" 2>/dev/null | sed 's/^/      /'
+        rm -rf "$probe_dir"
+        return 0
+    fi
+
+    "$jvm" -cp "$probe_dir" Probe >"${probe_dir}/out" 2>&1 || rc=1
+    out=$(cat "${probe_dir}/out" 2>/dev/null)
+    rm -rf "$probe_dir"
+
+    if [ "$rc" -eq 0 ] && echo "$out" | grep -q RUNTIME_OK; then
+        return 0
+    fi
+
+    echo "ERROR: 内置运行时自检未通过 —— jlink 裁剪的 jre 缺少必需模块。"
+    echo "       运行时: ${jvm}"
+    echo
+    echo "       缺失线索:"
+    echo "$out" | grep -iE "ClassNotFound|NoClassDefFound|Error|Exception" | head -5 | sed 's/^/         /'
+    echo
+    if echo "$out" | grep -qiE "awt|beans|imageio|desktop"; then
+        echo "       判定: 缺 java.desktop（验证码/二维码渲染必须，去掉会导致登录页崩溃）。"
+    elif echo "$out" | grep -qiE "sql"; then
+        echo "       判定: 缺 java.sql（JDBC 驱动）。"
+    elif echo "$out" | grep -qiE "naming|ldap"; then
+        echo "       判定: 缺 java.naming（LDAP/JNDI）。"
+    elif echo "$out" | grep -qiE "management"; then
+        echo "       判定: 缺 java.management（JMX/Druid 监控）。"
+    elif echo "$out" | grep -qiE "jgss|gss"; then
+        echo "       判定: 缺 java.security.jgss（Kerberos）。"
+    else
+        echo "       判定: 见上方异常；对照 bin/make-runtime.sh 的 --add-modules 清单补齐。"
+    fi
+    echo
+    echo "       修复: 重新生成运行时"
+    echo "             ./bin/make-runtime.sh --download"
+    echo "       或临时改用完整 JDK:"
+    echo "             export JAVA_HOME=/path/to/jdk-21 && ./bin/maxkeyctl.sh start"
     return 1
 }
 
@@ -193,6 +351,10 @@ do_start() {
         echo "       补救: ① 执行 bin/make-runtime.sh 生成包内 jre；或 ② export JAVA_HOME=/path/to/jdk-21"
         return 1
     }
+
+    # 启动前做一次运行时自检（仅对包内 jlink jre 生效，见函数注释）。
+    # 缺模块时在这里就明确报错，而不是等用户打开登录页渲染验证码时才崩。
+    runtime_selfcheck "$jvm" || return 1
 
     echo "-------------------------------------------------------------"
     echo "  启动 ${name}"
