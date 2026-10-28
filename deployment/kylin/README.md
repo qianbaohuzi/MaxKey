@@ -271,6 +271,18 @@ pnpm install --frozen-lockfile && pnpm run build:prod   # --base-href /maxkey-mg
 **node 22.23.2 / pnpm 12.6.0**（Angular 22.2.0 的 engines 是
 `^22.22.3 || ^24.15.0 || >=26.0.0`，24.14.0 不满足）。
 
+> **必须通过 corepack 调用 pnpm**，不要直接用 PATH 上的 `pnpm`。
+> 实测：用 pnpm 11.10.0 执行 `install --frozen-lockfile` 不会报错，
+> 而是**静默改写 `pnpm-lock.yaml`**（补 `@pnpm/exe` 等条目）。
+> `--frozen-lockfile` 只保证"不改依赖版本"，不保证"不重写文件格式"。
+>
+> `build-package.sh` 已对此加保护：构建前后比对 lockfile 校验和，
+> 被改写就报错退出。若需手工构建，用
+> `corepack pnpm install --frozen-lockfile`。
+>
+> 另：`$HOME` 不可写时 corepack 会因 `EACCES mkdir ~/.cache/node/corepack`
+> 直接崩；脚本会自动把 `COREPACK_HOME` 指到仓库内 `.cache/corepack`。
+
 ---
 
 ## 6. nginx：接进公共实例，不影响其他应用
@@ -680,6 +692,8 @@ LOGIN_MFA_ENABLED=false    # 无短信/邮箱通道时关掉 TOTP
 | `bootJar` ×2 | 成功（离线 11 秒），portal 205MB / mgt 196MB |
 | `pnpm install --frozen-lockfile` | 成功（1 分 0 秒），此前因缺 lockfile **必然失败** |
 | 前端构建 ×2 | portal 5.9s（初始包 2.51MB / gzip 489KB），mgt 9.9s |
+| 从干净树全量重建 | `build-package.sh --build` 1 分 24 秒，自动改用仓库内 `COREPACK_HOME` |
+| lockfile 完整性 | 裸 pnpm 执行会改写 lockfile（实测 +25 行）；脚本校验能拦下；corepack 路径无 drift |
 | 打包 | `maxkey-deploy-4.2.0.tar.gz` 361MB，结构完整 |
 
 ### 11.2 运行时
@@ -903,6 +917,8 @@ java.lang.NullPointerException: Cannot invoke "java.util.Collection.size()" beca
 | 改 DB 配置后不生效 | client 信息有 Caffeine 缓存 | 重启进程 |
 | 启动被拒绝，提示 DATABASE_PWD 为空 | 口令未注入 | 填 `/etc/maxkey/maxkey-secret.env` |
 | `Invalid redirect: ... does not match` | 回调地址与 client 注册值不一致 | 管理端改该应用的回调地址（精确匹配，含路径） |
+| 构建后 `pnpm-lock.yaml` 变脏 | 用了 PATH 上的 pnpm 而非 corepack | 改用 `corepack pnpm`；脚本会比对校验和并报错 |
+| 构建报 `EACCES ... corepack/v1` | `$HOME` 不可写 | 脚本已自动处理；手工构建时设 `COREPACK_HOME` |
 
 ---
 
