@@ -1,0 +1,51 @@
+[Unit]
+Description=MaxKey SSO Portal (认证中心) 9527
+Documentation=https://www.maxkey.top
+# 数据库在本机时必须等待其就绪；Kingbase 通常由 systemd 管理，故声明弱依赖
+After=network-online.target kingbase.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+# 用脚本自身做控制，避免 systemd 与脚本的 pid 记录两套并存
+PIDFile=/opt/maxkey/run/maxkey-portal.pid
+ExecStart=/opt/maxkey/bin/maxkeyctl.sh start portal
+ExecStop=/opt/maxkey/bin/maxkeyctl.sh stop portal
+RemainAfterExit=yes
+
+# 端口就绪判断交给脚本，这里给足超时（首次启动要建连接池、加载方言）
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+# 以专用低权限用户运行，减小被攻击面
+User=maxkey
+Group=maxkey
+WorkingDirectory=/opt/maxkey
+
+# 环境变量一律由 maxkeyctl.sh 自行 source conf/maxkey.env。
+# 这里**不再**用 EnvironmentFile 重复加载：systemd 的 EnvironmentFile 与
+# shell 的 source 语法规则不同（例如 conf 中 DATABASE_URL 用单引号包裹
+# 含 & 的 URL，systemd 会保留引号字面量），两套解析并存容易出现
+# "手工启动正常、systemd 启动连错库" 这类难查问题。单一来源更可靠。
+#
+# 唯一例外：数据库口令不写入 conf/maxkey.env，改由独立密钥文件注入。
+# 该文件仅一行 DATABASE_PWD=...，无引号/转义歧义，可安全交给 systemd 解析。
+# 权限应为 600 root:root。前缀 - 表示文件不存在时不报错，
+# 由 maxkeyctl.sh 在启动时显式拦截并给出注入提示。
+EnvironmentFile=-/etc/maxkey/maxkey-secret.env
+Environment="LANG=zh_CN.UTF-8"
+
+# 加固（对 Java 应用均安全）
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/maxkey/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

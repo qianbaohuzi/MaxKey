@@ -1,0 +1,40 @@
+[Unit]
+Description=MaxKey Mgt Console (管理端) 9526
+Documentation=https://www.maxkey.top
+After=network-online.target maxkey-portal.service kingbase.service
+Wants=network-online.target
+# 管理端通过 CAS 依赖认证中心，认证中心起不来时管理端登录也会失败
+Requires=maxkey-portal.service
+
+[Service]
+Type=forking
+PIDFile=/opt/maxkey/run/maxkey-mgt.pid
+ExecStart=/opt/maxkey/bin/maxkeyctl.sh start mgt
+ExecStop=/opt/maxkey/bin/maxkeyctl.sh stop mgt
+RemainAfterExit=yes
+
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+User=maxkey
+Group=maxkey
+WorkingDirectory=/opt/maxkey
+
+# 环境变量统一由 maxkeyctl.sh 从 conf/maxkey.env 加载，避免两套解析规则
+# 例外：数据库口令走独立密钥文件（仅一行 DATABASE_PWD=...，权限 600 root:root）
+EnvironmentFile=-/etc/maxkey/maxkey-secret.env
+Environment="LANG=zh_CN.UTF-8"
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/maxkey_mgt/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

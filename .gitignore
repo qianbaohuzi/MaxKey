@@ -57,3 +57,17 @@ maxkey-web-frontend/maxkey-web-ng/dist
 **/out/*
 /.sonarlint
 **/**/package-lock.json
+
+# 数据库口令密钥文件：由部署环境注入（systemd EnvironmentFile），禁止入库
+# 实际位置 /etc/maxkey/maxkey-secret.env；此处防御仓库内误放副本
+maxkey-secret.env
+
+# make-runtime.sh 的 Temurin 下载缓存（约 545MB，含压缩包与解压副本）
+# 仅本机构建加速用，不入库；删除该目录即强制重新下载。
+# 必须用 **/ 前缀：脚本默认缓存到 <包根>/.cache/temurin，
+# 即 deployment/kylin/.cache/temurin，写成 .cache/temurin/ 只匹配仓库根、会漏掉它。
+**/.cache/temurin/
+
+# 例外：部署脚本（**/bin 是 Eclipse 产物目录规则，不适用于本目录）
+!deployment/kylin/bin/
+!deployment/kylin/bin/**
