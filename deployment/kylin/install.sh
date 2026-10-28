@@ -265,11 +265,45 @@ if [ "$DO_NGINX" = "1" ]; then
         rm -f "$RENDERED"
         die "站点配置渲染后仍残留占位域名，请检查 nginx/maxkey-site.conf"
     fi
-    if grep -qE "^\s+listen\s+443 ssl;" "$RENDERED"; then
-        rm -f "$RENDERED"
-        warn "站点配置的 IPv4 端口未被替换（可能模板格式已变）"
+    # 注意：只有当目标端口**不是** 443 时才需要校验。
+    # 目标就是 443 时，替换前后完全相同，grep 必然命中 —— 那是正常的，
+    # 不能报"未替换"，否则每次标准端口部署都会出现一条假告警，
+    # 久而久之会让人忽略真正的告警。
+    if [ "${NGINX_TLS_PORT:-443}" != "443" ]; then
+        if grep -qE "^\s+listen\s+443 ssl;" "$RENDERED"; then
+            rm -f "$RENDERED"
+            die "站点配置的 IPv4 端口未被替换（期望 ${NGINX_TLS_PORT}，实际仍是 443）"
+        fi
     fi
 
+
+    # 端口占用预检：在写任何文件之前就拦住。
+    #
+    # 为什么提前做：如果等到 reload 才发现端口不可用，此时站点文件已经写进去，
+    # reload 失败还可能连带影响同实例上的其他站点（nginx 是单进程，
+    # 一次失败的 reload 有可能让原本正常的站点也一起不可用）。
+    # 提前检测可以把风险降到零 —— 什么都没写，直接报错退出。
+    #
+    # WSL 环境特别容易踩：Windows 侧的端口转发会让 Linux 里 ss 看不到占用者，
+    # 但 bind() 就是失败。所以这里除了看 ss，还要提示用 Windows 侧工具核对。
+    if [ "$DRY_RUN" = "0" ]; then
+        if (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -qE "[:.]${NGINX_TLS_PORT:-443}[[:space:]]"; then
+            # 端口已被监听。只有"已经被本文件自己占用"（重复安装）才是允许的
+            OCC=$( (ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null) | grep -E "[:.]${NGINX_TLS_PORT:-443}[[:space:]]" | head -3 )
+            warn "端口 ${NGINX_TLS_PORT:-443} 已被监听："
+            echo "$OCC" | sed 's/^/      /'
+            if echo "$OCC" | grep -q "nginx"; then
+                warn "占用者包含 nginx，若这是上一次安装的 MaxKey 站点则可继续（将覆盖）"
+            else
+                rm -f "$RENDERED"
+                die "端口 ${NGINX_TLS_PORT:-443} 被非 nginx 进程占用，已中止（未改动任何 nginx 文件）。
+       WSL 环境下若 ss 看不到占用者但 bind 仍失败，多半是 Windows 侧端口转发：
+         在 Windows PowerShell 执行 netstat -ano | findstr :${NGINX_TLS_PORT:-443}
+         或 netsh interface portproxy show all
+       请改用其他端口（conf/maxkey.env 的 NGINX_TLS_PORT 与 MAXKEY_PUBLIC_URL 要同步改）"
+            fi
+        fi
+    fi
 
     # 若现场已有同 server_name + 同端口的站点，直接接入会产生
     # "conflicting server name" 且实际生效的是先加载的那个 —— 必须先报错。
@@ -289,11 +323,6 @@ if [ "$DO_NGINX" = "1" ]; then
     if [ "$DRY_RUN" = "0" ]; then
         if nginx -t 2>/tmp/nginx-t.err; then
             info "nginx -t 通过"
-            if nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null; then
-                info "nginx 已 reload"
-            else
-                warn "reload 失败，请手工执行: nginx -s reload"
-            fi
         else
             warn "nginx -t 未通过，正在回滚刚安装的站点文件："
             sed 's/^/      /' /tmp/nginx-t.err
@@ -301,7 +330,78 @@ if [ "$DO_NGINX" = "1" ]; then
             if [ -n "$BACKUP" ]; then cp -a "$BACKUP" "$NGINX_SITE"; fi
             die "nginx 配置校验失败，已回滚。请检查证书路径与端口占用"
         fi
+
+        # ---- reload 并【真正验证端口已监听】----
+        #
+        # 这里踩过一次真实事故，教训写下来：
+        #
+        # `nginx -s reload` 即使失败也常常返回 0。绑不上端口时它只把
+        # [emerg] bind() to 0.0.0.0:<port> failed (98: Address already in use)
+        # 写进 error.log，命令本身照样退出 0。
+        # 于是脚本兴高采烈报"已 reload"，而实际端口从未开始监听 ——
+        # 更糟的是 reload 失败后新配置未生效、旧 worker 也可能被回收，
+        # 连原本正常的站点都会一起不可用。
+        #
+        # 所以必须做三件事：清空错误日志 → reload → 回读错误日志并探测端口。
+        # 任何一项不通过就回滚站点文件并尝试恢复 nginx。
+        ERR_LOG=""
+        for f in /var/log/nginx/error.log /var/log/nginx/error_log; do
+            [ -f "$f" ] && { ERR_LOG="$f"; break; }
+        done
+        if [ -n "$ERR_LOG" ]; then
+            ERR_MARK=$(wc -l < "$ERR_LOG" 2>/dev/null || echo 0)
+        else
+            ERR_MARK=0
+        fi
+
+        RELOAD_OK=0
+        if nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null; then
+            RELOAD_OK=1
+        fi
+
+        # 给 nginx 一点时间完成 bind
+        sleep 2
+
+        PORT_FAIL=""
+        # 1) 错误日志里是否出现 bind 失败
+        if [ -n "$ERR_LOG" ] && [ "$RELOAD_OK" = "1" ]; then
+            NEW_ERRS=$(tail -n +$((ERR_MARK + 1)) "$ERR_LOG" 2>/dev/null | grep -E "\[emerg\]|could not bind" || true)
+            if [ -n "$NEW_ERRS" ]; then
+                PORT_FAIL="错误日志出现 emerg"
+                echo "$NEW_ERRS" | head -5 | sed 's/^/      /'
+            fi
+        fi
+
+        # 2) 端口是否真的在监听
+        if [ -z "$PORT_FAIL" ]; then
+            if ! (ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -qE "[:.]${NGINX_TLS_PORT:-443}[[:space:]]"; then
+                PORT_FAIL="端口 ${NGINX_TLS_PORT:-443} 未处于监听状态"
+            fi
+        fi
+
+        if [ "$RELOAD_OK" != "1" ] || [ -n "$PORT_FAIL" ]; then
+            warn "nginx 未能按新配置生效：${PORT_FAIL:-reload 命令失败}"
+            warn "正在回滚站点文件并尝试恢复 nginx ..."
+            rm -f "$NGINX_SITE"
+            if [ -n "$BACKUP" ]; then
+                cp -a "$BACKUP" "$NGINX_SITE"
+            fi
+            nginx -t >/dev/null 2>&1 && { systemctl restart nginx 2>/dev/null || nginx -s reload 2>/dev/null; } || true
+            sleep 2
+            if systemctl is-active nginx >/dev/null 2>&1; then
+                warn "nginx 已恢复到回滚前的配置并正常运行"
+            else
+                warn "!! nginx 当前未运行，请立即人工介入: systemctl status nginx"
+            fi
+            die "站点配置未能生效，已回滚。常见原因：
+       1) 端口 ${NGINX_TLS_PORT:-443} 已被其他进程占用（WSL 下 Windows 侧端口转发很常见，
+          用 ss -lntp | grep :${NGINX_TLS_PORT:-443} 与 netstat -ano 对照确认）
+       2) 证书路径不可读
+       请换一个端口后重新执行，或先释放该端口。"
+        fi
+        info "nginx 已 reload，端口 ${NGINX_TLS_PORT:-443} 确认监听中"
     fi
+
     [ -n "$BACKUP" ] && rm -f "$BACKUP"
 fi
 

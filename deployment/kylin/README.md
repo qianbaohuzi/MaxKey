@@ -913,6 +913,8 @@ java.lang.NullPointerException: Cannot invoke "java.util.Collection.size()" beca
 | 分页 SQL 报错 | 方言未生效 | `DATABASE_DIALECT=kingbase` |
 | 页面能开但 API 全 404 | `proxy_pass` 漏尾部路径 | `proxy_pass .../sign/;` |
 | 改了 nginx 配置不生效 | 存在同 `server_name` 的另一个站点 | `nginx -t` 会报 `conflicting server name`；`install.sh` 会提前拦 |
+| **nginx 报 `bind() to 0.0.0.0:443 failed` 但 `ss` 看不到占用者** | WSL 下 Windows 侧端口转发占用了该端口 | 换端口（如 9443），`NGINX_TLS_PORT` 与 `MAXKEY_PUBLIC_URL` 同步改；Windows 侧用 `netstat -ano \| findstr :443` 或 `netsh interface portproxy show all` 核对 |
+| `nginx -s reload` 返回 0 但端口没起来 | reload 失败只写 error.log，命令本身仍退出 0 | `install.sh` 已改为 reload 后校验端口监听并自动回滚；手工操作时务必看 `/var/log/nginx/error.log` |
 | `.js` 报 `Unexpected token '<'` | 静态资源缺失回退到了 index.html | 静态资源 location 用 `try_files $uri =404` |
 | 改 DB 配置后不生效 | client 信息有 Caffeine 缓存 | 重启进程 |
 | 启动被拒绝，提示 DATABASE_PWD 为空 | 口令未注入 | 填 `/etc/maxkey/maxkey-secret.env` |
