@@ -46,17 +46,26 @@ setEnvVars.bat
 
 maxkey-web-frontend/maxkey-web-mgt-ng/node_modules/
 maxkey-web-frontend/maxkey-web-mgt-ng/.angular
-maxkey-web-frontend/maxkey-web-mgt-ng/yarn.lock
 maxkey-web-frontend/maxkey-web-mgt-ng/dist
 
 maxkey-web-frontend/maxkey-web-ng/node_modules/
 maxkey-web-frontend/maxkey-web-ng/.angular/
-maxkey-web-frontend/maxkey-web-ng/yarn.lock
 maxkey-web-frontend/maxkey-web-ng/dist
 
 **/out/*
 /.sonarlint
+
+# 锁文件必须入库：构建可复现的唯一保证。
+# 历史原因曾忽略 yarn.lock，导致构建机每次都要重新解析依赖，
+# 同一提交在不同时间可能产出不同前端包。现已统一到 pnpm，
+# 两个前端的 pnpm-lock.yaml 都在版本控制内，禁止忽略。
+# 下面这条只挡 npm 的旧锁文件（本项目不用 npm 构建）。
 **/**/package-lock.json
+
+# 构建机本地的 pnpm 依赖存储与 corepack 下载缓存（不入库）
+.pnpm-store/
+.cache/
+.gradle-home/
 
 # 数据库口令密钥文件：由部署环境注入（systemd EnvironmentFile），禁止入库
 # 实际位置 /etc/maxkey/maxkey-secret.env；此处防御仓库内误放副本
