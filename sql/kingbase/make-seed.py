@@ -75,18 +75,34 @@ KEEP_TABLES = {
     "mxk_apps",
     "mxk_apps_adapters",
     "mxk_apps_cas_details",
-    "mxk_apps_oauth_client_details",
     "mxk_apps_saml_v20_details",
     "mxk_apps_jwt_details",
     "mxk_apps_token_based_details",
     "mxk_apps_form_based_details",
     "mxk_access",
     "mxk_socials_provider",
-    # --- OAuth2/OIDC client 注册信息 ---
-    # 每个应用的 client_id / client_secret / redirect_uri / issuer / audience 都在这里。
-    # 缺了它，应用列表能看到但点进去授权会报 NoSuchClientException。
+    # 注意：mxk_apps_oauth_client_details **不在**保留列表里。
+    # 官方 dump 里这 14 条 client 的 redirect_uri 全部指向演示域名
+    # （gitlab.maxkey.top / o2oa.maxkey.top / oauth.demo.maxkey.top:9521 /
+    #  www.ssss.com / anywhere …），且 13 条 issuer 为空。
+    # 后果：
+    #   * 浏览器授权后跳到不存在的域名，业务系统收不到 code；
+    #   * issuer 为空时 id_token 根本没有 iss 声明（OIDC 规范要求必须有），
+    #     标准客户端库会直接拒绝。
+    # 也就是说这些 client 一个都不能用，留着只会在控制台里制造
+    # "点进去就报错"的条目。真实接入时应在管理端重新创建。
+}
+
+# 整表剔除 INSERT（表结构保留，数据不导入）
+# 与 KEEP_TABLES 的区别：这里用于"结构要、数据不要"的表。
+EMPTY_TABLES = {
+    # OAuth/OIDC client 注册信息：演示数据全部不可用，见上方说明。
     "mxk_apps_oauth_client_details",
 }
+
+# 按协议剔除 mxk_apps 中的演示应用
+# 这些 app 与上面的 client 一一对应（id 相同），client 没了 app 就是空壳。
+DROP_APP_PROTOCOLS = ("OAuth_v2.0", "OAuth_v2.1", "OpenID_Connect_v1.0")
 
 # 只保留指定行（表 -> 判定函数）
 ONLY_ROWS = {
@@ -143,6 +159,21 @@ def main():
             continue
         tbl = m.group(1)
         before = len(ln.encode("utf-8", "surrogateescape"))
+
+        # 整表剔除：结构保留、数据不要
+        if tbl in EMPTY_TABLES:
+            dropped[tbl] = dropped.get(tbl, 0) + 1
+            continue
+
+        # mxk_apps 按协议剔除演示应用。
+        # mxk_apps 的 INSERT 是带列名的长行，protocol 字段在固定位置不易解析，
+        # 因此用"协议字符串是否出现在该行"来判定。
+        # 注意必须要求整词匹配，避免 OAuth_v2.0 误伤 OAuth_v2.01 这类；
+        # 本数据集中协议值是固定枚举，实际不会出现前缀歧义。
+        if tbl == "mxk_apps" and any(
+                re.search(r"E'%s'" % re.escape(p), ln) for p in DROP_APP_PROTOCOLS):
+            dropped[tbl] = dropped.get(tbl, 0) + 1
+            continue
 
         keep = False
         if tbl in KEEP_TABLES:
