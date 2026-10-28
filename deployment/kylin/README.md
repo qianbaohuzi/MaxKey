@@ -404,6 +404,18 @@ location /sign/ {
 `install.sh` 会校验 `MAXKEY_PUBLIC_URL` 的 host 与 port 同
 `NGINX_SERVER_NAME` / `NGINX_TLS_PORT` 一致，不一致直接拒绝安装。
 
+**端口选择的一个现实约束（WSL 环境实测）**：
+
+443 在不少环境已被占用，且 WSL 下往往是 **Windows 侧端口转发**占的 ——
+此时 Linux 里 `ss -lntp` 看不到占用者，但 nginx `bind()` 就是失败。
+遇到这种情况直接换端口（例如 9443），并把 `MAXKEY_PUBLIC_URL` 同步改成
+带端口的形式（`https://<域>:9443`）。两者必须一起改，否则 JWT 的 iss
+与 OIDC issuer 会不一致。
+
+**curl 排查时的代理陷阱**：如果环境里设了 `http_proxy/https_proxy`，
+`curl` 可能把请求发到代理而不是本机 nginx，表现为连接失败或超时，
+而浏览器却完全正常。排查时加 `--noproxy '*'`，或先 `unset` 代理变量。
+
 ---
 
 ## 7. 对外地址：`MAXKEY_PUBLIC_URL` 是唯一入口
@@ -915,6 +927,8 @@ java.lang.NullPointerException: Cannot invoke "java.util.Collection.size()" beca
 | 改了 nginx 配置不生效 | 存在同 `server_name` 的另一个站点 | `nginx -t` 会报 `conflicting server name`；`install.sh` 会提前拦 |
 | **nginx 报 `bind() to 0.0.0.0:443 failed` 但 `ss` 看不到占用者** | WSL 下 Windows 侧端口转发占用了该端口 | 换端口（如 9443），`NGINX_TLS_PORT` 与 `MAXKEY_PUBLIC_URL` 同步改；Windows 侧用 `netstat -ano \| findstr :443` 或 `netsh interface portproxy show all` 核对 |
 | `nginx -s reload` 返回 0 但端口没起来 | reload 失败只写 error.log，命令本身仍退出 0 | `install.sh` 已改为 reload 后校验端口监听并自动回滚；手工操作时务必看 `/var/log/nginx/error.log` |
+| **只重启 portal 后 mgt 变 failed 且不自愈** | mgt 单元声明了 `Requires=maxkey-portal.service` | 已改为只用 `After=` 表达启动顺序（见 §14）；旧单元需手工 `reset-failed` 后 start |
+| **curl 访问 MaxKey 返回 000 但浏览器正常** | 环境变量 `http_proxy/https_proxy` 指向本地代理，`no_proxy` 的 `*.domain` 通配不被 curl 支持 | 用 `curl --noproxy '*'`；或把具体域名写进 `no_proxy` |
 | `.js` 报 `Unexpected token '<'` | 静态资源缺失回退到了 index.html | 静态资源 location 用 `try_files $uri =404` |
 | 改 DB 配置后不生效 | client 信息有 Caffeine 缓存 | 重启进程 |
 | 启动被拒绝，提示 DATABASE_PWD 为空 | 口令未注入 | 填 `/etc/maxkey/maxkey-secret.env` |

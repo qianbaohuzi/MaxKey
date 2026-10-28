@@ -1,10 +1,24 @@
 [Unit]
 Description=MaxKey Mgt Console (管理端) 9526
 Documentation=https://www.maxkey.top
+# After 只表达"启动顺序"：等 portal 与数据库就绪后再起本服务。
 After=network-online.target maxkey-portal.service kingbase.service
 Wants=network-online.target
-# 管理端通过 CAS 依赖认证中心，认证中心起不来时管理端登录也会失败
-Requires=maxkey-portal.service
+
+# 这里**不能用 Requires=maxkey-portal.service**，踩过坑：
+#
+#   Requires 表达的是"强依赖其存活"，后果有三个，都是坏事：
+#     1. `systemctl stop maxkey-portal` 会连带停掉 mgt ——
+#        只想重启认证中心时，管理端被静默带走。
+#     2. `systemctl restart maxkey-portal` 期间 mgt 被判 Dependency failed，
+#        且 **不会自动恢复**，必须手工 reset-failed + start。
+#     3. portal 启动失败时 mgt 根本起不来，两个服务互相拖累。
+#
+#   而管理端对认证中心的真实依赖只是"启动时它已就绪"（CAS 登录需要），
+#   运行期两者各自独立；portal 短暂不可用时 mgt 自身仍能提供配置界面。
+#   所以用 After 表达顺序即可，不声明 Requires。
+#
+#   若现场确实要求两者严格同生共死，可自行加 Requires，但要清楚上面三点代价。
 
 [Service]
 Type=forking
