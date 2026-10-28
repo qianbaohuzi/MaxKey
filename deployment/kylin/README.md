@@ -515,6 +515,34 @@ MAXKEY_SCHEME=https
 `maxkeyctl.sh` 会对第 1 类错误做**显式校验**并在启动前报错退出，
 而不是让它静默生效。
 
+#### 数据库口令：不落在配置文件里
+
+`conf/maxkey.env` 是**被 git 跟踪的模板**。若在其中填明文口令，
+`git add` 会把口令永久写入提交历史，事后删除也无法真正抹除。
+因此口令改为运行期注入，配置文件里只有一行继承：
+
+```bash
+DATABASE_PWD="${DATABASE_PWD:-}"
+```
+
+三种注入方式（按推荐度）：
+
+| 方式 | 做法 | 适用 |
+|------|------|------|
+| **独立密钥文件**（推荐） | `/etc/maxkey/maxkey-secret.env`，600 root:root，systemd 单元已引用 | 生产 |
+| systemd 内联 | 单元里 `Environment="DATABASE_PWD=..."`（单元需 600） | 临时 |
+| 环境变量 | `export DATABASE_PWD=... && ./bin/maxkeyctl.sh start` | 调试 |
+
+密钥文件模板见 `conf/maxkey-secret.env.example`，格式要求：
+
+- 每行 `KEY=VALUE`，**不要写 `export`**
+- 口令含 `$` `` ` `` `\` `"` 时**必须用单引号**包裹，否则会被变量展开
+- systemd 对单引号的处理与 POSIX shell 一致（剥掉引号），
+  所以 `DATABASE_PWD='p@ss'` 传给进程的是 `p@ss`
+
+> 未注入时 `maxkeyctl.sh` 会在启动前显式报错并给出注入指引，
+> 不会让你带着空口令去撞一个 `password authentication failed`。
+
 ### 6.2 启动
 
 ```bash
@@ -724,8 +752,20 @@ cd /opt/maxkey
 # 4. 建库
 ksql -U system -d maxkey -f sql/maxkey.sql
 
-# 5. 改配置（唯一需要编辑的文件）
+# 5. 改配置（域名、数据库地址等；**口令不写在这里**）
 vi conf/maxkey.env
+
+# 5.1 注入数据库口令（必需，否则启动会被显式拦下）
+#     口令不写入 conf/maxkey.env —— 那是被 git 跟踪的模板，
+#     填明文会直接进提交历史。改用仓库外的独立密钥文件。
+sudo mkdir -p /etc/maxkey
+sudo cp conf/maxkey-secret.env.example /etc/maxkey/maxkey-secret.env
+sudo vi /etc/maxkey/maxkey-secret.env        # 填入真实口令
+sudo chown root:root /etc/maxkey/maxkey-secret.env
+sudo chmod 600 /etc/maxkey/maxkey-secret.env
+
+#     手工启动（不走 systemd）则直接导出环境变量即可：
+#     export DATABASE_PWD='实际口令' && ./bin/maxkeyctl.sh start
 
 # 6. 部署前端与 nginx（选方案 A 或 B）
 mkdir -p /opt/maxkey/web

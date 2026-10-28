@@ -149,6 +149,22 @@ else
         err "DATABASE_URL 为空（常见原因：JDBC URL 中 & 未加引号）"
     else
         ok "DATABASE_URL 已设置"
+
+        # 口令注入检查。放在这里而非留到启动，避免"自检全绿但一启动就失败"。
+        if [ -z "${DATABASE_PWD:-}" ]; then
+            if [ -f /etc/maxkey/maxkey-secret.env ]; then
+                warn "DATABASE_PWD 未在本 shell 生效，但检测到 /etc/maxkey/maxkey-secret.env"
+                echo "         若用 systemd 启动则正常；手工启动需先 source 该文件或 export"
+            else
+                err "DATABASE_PWD 为空且未找到 /etc/maxkey/maxkey-secret.env"
+                echo "         注入方法：sudo cp conf/maxkey-secret.env.example /etc/maxkey/maxkey-secret.env"
+                echo "                   然后填入口令并 chmod 600"
+                echo "         手工启动：export DATABASE_PWD='实际口令'"
+            fi
+        else
+            ok "DATABASE_PWD 已注入（长度 ${#DATABASE_PWD}，不显示内容）"
+        fi
+
         case "${DATABASE_URL}" in
             *kingbase8*)
                 [ "${DATABASE_DIALECT:-}" = "kingbase" ] \

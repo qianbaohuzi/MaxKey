@@ -100,6 +100,8 @@ cp "${HERE}/bin/maxkeyctl.sh"    "$OUT/bin/"
 cp "${HERE}/bin/make-runtime.sh" "$OUT/bin/"
 cp "${HERE}/bin/preflight.sh"    "$OUT/bin/"
 cp "${HERE}/conf/maxkey.env"     "$OUT/conf/"
+# 口令密钥模板：运维据此创建 /etc/maxkey/maxkey-secret.env
+cp "${HERE}/conf/maxkey-secret.env.example" "$OUT/conf/" 2>/dev/null || true
 cp "${HERE}/nginx/"*.conf        "$OUT/nginx/"
 cp "${HERE}/systemd/"*.service   "$OUT/systemd/"
 cp "${REPO}/sql/kingbase/maxkey.sql"        "$OUT/sql/"
