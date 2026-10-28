@@ -75,17 +75,51 @@ if [ "$DO_BUILD" = "1" ]; then
     #
     # corepack 在 $HOME 不可写时会失败（EACCES mkdir ~/.cache/node/corepack），
     # 故允许用 COREPACK_HOME 指向可写目录、COREPACK_CMD 指定调用方式。
+    # 必须用 corepack 拉起 package.json 里声明的那个 pnpm 版本。
+    #
+    # 实测过踩坑：直接用 PATH 上的 pnpm（本机是 11.10.0）执行
+    # `install --frozen-lockfile`，**不会报错，而是静默把 lockfile 改写**，
+    # 而且是往 packageManagerDependencies 里补 @pnpm/exe 之类的条目。
+    # 结果就是"构建成功但工作区变脏"，同一个提交在不同机器上产出不同包。
+    # --frozen-lockfile 只保证"不改依赖版本"，不保证"不重写文件格式"。
+    #
+    # 因此这里做三件事：
+    #   1. 通过 corepack 固定 pnpm 版本（读 package.json 的 packageManager）
+    #   2. 构建前记录 lockfile 校验和
+    #   3. 构建后比对，一旦被改写立即报错
+    # corepack 默认把下载的 pnpm 放到 ~/.cache/node/corepack。
+    # 在 $HOME 不可写（CI 容器、只读家目录、跳板机）时会直接崩：
+    #   Error: EACCES: permission denied, mkdir '~/.cache/node/corepack/v1'
+    # 所以这里探测家目录可写性，不可写就把它指到仓库内的缓存目录。
+    if [ -z "${COREPACK_HOME:-}" ]; then
+        if ! ( mkdir -p "${HOME}/.cache/node/corepack" 2>/dev/null ); then
+            export COREPACK_HOME="${REPO}/.cache/corepack"
+            mkdir -p "$COREPACK_HOME"
+            echo "  \$HOME 不可写，COREPACK_HOME 改用 ${COREPACK_HOME}"
+        fi
+    fi
+
     for d in maxkey-web-ng maxkey-web-mgt-ng; do
         fdir="${REPO}/maxkey-web-frontend/${d}"
-        [ -f "${fdir}/pnpm-lock.yaml" ] || {
-            echo "ERROR: 缺少 ${fdir}/pnpm-lock.yaml"
+        lock="${fdir}/pnpm-lock.yaml"
+        [ -f "$lock" ] || {
+            echo "ERROR: 缺少 ${lock}"
             echo "       该文件必须入库，否则构建不可复现。"
-            echo "       修复: cd ${fdir} && pnpm install --lockfile-only"
+            echo "       修复: cd ${fdir} && corepack pnpm install --lockfile-only"
             exit 1
         }
-        ( cd "$fdir" && ${COREPACK_CMD:-pnpm} install --frozen-lockfile && \
+        before=$(cksum "$lock" | awk '{print $1"-"$2}')
+        ( cd "$fdir" && ${COREPACK_CMD:-corepack pnpm} install --frozen-lockfile && \
           NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8000}" \
-          ${COREPACK_CMD:-pnpm} run build:prod )
+          ${COREPACK_CMD:-corepack pnpm} run build:prod )
+        after=$(cksum "$lock" | awk '{print $1"-"$2}')
+        if [ "$before" != "$after" ]; then
+            echo "ERROR: 构建过程改写了 ${lock}"
+            echo "       说明用的 pnpm 版本与 lockfile 不匹配。"
+            echo "       请用 corepack 执行，或先人工更新并提交 lockfile："
+            echo "         cd ${fdir} && corepack pnpm install --lockfile-only"
+            exit 1
+        fi
     done
 
     PORTAL_JAR=$(ls -1 "${REPO}"/maxkey-webs/maxkey-web-maxkey/build/libs/maxkey-boot-*ga.jar 2>/dev/null | head -1 || true)
