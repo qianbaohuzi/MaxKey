@@ -43,6 +43,7 @@ import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.security.authentication.BadCredentialsException;
@@ -54,8 +55,20 @@ import org.springframework.stereotype.Repository;
 public class LoginServiceImpl  implements LoginService{
     private static final Logger _logger = LoggerFactory.getLogger(LoginServiceImpl.class);
 
-    private static final String LOGIN_USERINFO_UPDATE_STATEMENT = "update mxk_userinfo set badpasswordcount = 0 , logincount = logincount + 1 , lastlogintime = ?  , lastloginip = ? , online = "
-            + UserInfo.ONLINE.ONLINE + "  where id = ?";
+    /**
+     * 登录成功后的用户信息回写 SQL 的固定前缀。
+     * <p>
+     * 注意：这条 SQL 是手写常量，不经过 MyBatis 的 mapper XML，因此
+     * {@code mybatis.table-column-escape} 对它<b>不生效</b>。
+     * 而 KingbaseES 在 MySQL 兼容模式下 {@code online} 属于保留字（catcode=R），
+     * 裸写会抛 {@code syntax error at or near "online"}，导致登录接口整体失败
+     * （token 已签发但最终返回 code=2，且 logincount / online 标记都没写进去）。
+     * 故 online 列名改为由 {@link #buildLoginUserinfoUpdateStatement()} 按
+     * 与 mybatis 相同的配置动态拼接；MySQL 下仍为裸 online，行为不变。
+     * </p>
+     */
+    private static final String LOGIN_USERINFO_UPDATE_STATEMENT_HEAD =
+            "update mxk_userinfo set badpasswordcount = 0 , logincount = logincount + 1 , lastlogintime = ?  , lastloginip = ? , ";
 
     private static final String GROUPS_SELECT_STATEMENT = "select distinct g.id,g.groupcode,g.groupname from mxk_userinfo u,mxk_groups g,mxk_group_member gm where u.id = ?  and u.id=gm.memberid and gm.groupid=g.id ";
 
@@ -77,6 +90,14 @@ public class LoginServiceImpl  implements LoginService{
     
     @Autowired
     CnfPasswordPolicyService cnfPasswordPolicyService;
+
+    /** 与 mybatis.table-column-escape 同源，用于手写 SQL 的标识符转义 */
+    @Value("${mybatis.table-column-escape:false}")
+    private boolean tableColumnEscape;
+
+    /** 与 mybatis.table-column-escape-char 同源 */
+    @Value("${mybatis.table-column-escape-char:`}")
+    private String tableColumnEscapeChar;
 
     /**
      * 1 (USERNAME)  2 (USERNAME | MOBILE) 3 (USERNAME | MOBILE | EMAIL)
@@ -387,9 +408,26 @@ public class LoginServiceImpl  implements LoginService{
     }
 
 
+    /**
+     * 按当前方言拼出 online 列的写法。
+     * MySQL 下返回裸 {@code online}（与历史行为一致）；
+     * 开启标识符转义时（Kingbase/PostgreSQL 场景）返回 {@code "online"}。
+     */
+    private String buildLoginUserinfoUpdateStatement() {
+        String onlineColumn = "online";
+        if (tableColumnEscape) {
+            String escapeChar = StringUtils.isBlank(tableColumnEscapeChar) ? "`" : tableColumnEscapeChar;
+            onlineColumn = escapeChar + "online" + escapeChar;
+        }
+        return LOGIN_USERINFO_UPDATE_STATEMENT_HEAD
+                + onlineColumn
+                + " = " + UserInfo.ONLINE.ONLINE
+                + "  where id = ?";
+    }
+
     @Override
     public void updateLastLogin(UserInfo userInfo) {
-        jdbcTemplate.update(LOGIN_USERINFO_UPDATE_STATEMENT,
+        jdbcTemplate.update(buildLoginUserinfoUpdateStatement(),
                 new Object[] {
                                 userInfo.getLastLoginTime(),
                                 userInfo.getLastLoginIp(),
