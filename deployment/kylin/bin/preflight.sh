@@ -236,10 +236,12 @@ sec "8. nginx"
 if command -v nginx >/dev/null 2>&1; then
     ok "已安装: $(nginx -v 2>&1)"
     if systemctl is-active nginx >/dev/null 2>&1; then
-        ok "nginx 正在运行（建议采用方案 B：合并进现有站点）"
-        echo "         追加: nginx/maxkey-into-existing.conf → 现有 server{} 内 include"
+        ok "nginx 正在运行"
+        echo "         接入方式: 新增 conf.d/maxkey.conf（独立 server 块）"
+        echo "         检查冲突: grep -rl 'server_name.*<你的域名>' /etc/nginx/conf.d/"
+        echo "         同域名同端口双站点会导致 nginx 只采用先加载者，install.sh 会提前拦截"
     else
-        ok "nginx 已安装但未运行（可用方案 A：独立站点）"
+        ok "nginx 已安装但未运行，启动后再校验配置"
     fi
     if command -v semanage >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
         warn "SELinux 为 Enforcing，nginx 反代可能被拒绝，需: setsebool -P httpd_can_network_connect 1"

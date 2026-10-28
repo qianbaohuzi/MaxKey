@@ -1,87 +1,187 @@
-# MaxKey 麒麟系统部署方案（KingbaseES + 内置 JDK）
+# MaxKey 裸机部署方案（KingbaseES + 内置精简 JDK + 公共 nginx）
 
-> 本文配套脚本位于 `deployment/kylin/`，所有配置均已在本仓库实测通过：
-> 应用在 `jlink` 裁剪运行时（64MB）上 6–8 秒内启动，`admin` 登录、租户域名解析、
-> OIDC 元数据、验证码渲染、SSO 回跳均已验证。文末列出验证记录与踩坑清单。
+> 配套脚本位于 `deployment/kylin/`。本文所有结论均来自实测，验证记录见 §11。
+>
+> 目标形态：**两个 jar + 一个 jlink 运行时 + 一份 nginx 站点文件**，
+> 不依赖目标机 JDK，不要求 Docker，不动目标机已有的 nginx 站点。
 
-## 1. 现状与结论速览
+---
+
+## 1. 结论速览
 
 | 问题 | 结论 |
 |------|------|
-| 麒麟没有 JDK 21 怎么办 | 用**启动包内置 jlink 运行时**（64MB），不依赖目标机 JDK；`maxkeyctl.sh` 自动探测 |
-| 前端怎么启动 | **纯静态文件，不需要 Node**；构建机出 `dist/browser` 后拷到目标机即可 |
-| 是否单独起 nginx | 两种都行。**推荐复用已有 nginx**（不占新端口、少一个进程），见 §5 方案 B |
-| 已有 nginx 能否合并 | 能，且实测可行；但**必须避开 `alias` + `try_files` 组合**，见 §5.3 |
-| 域名起什么作用 | 三处独立作用：①租户识别 ②协议/端口拼接的 SSO 回跳地址 ③Cookie 域。见 §7 |
-| SSO 最小化 | 只跑 `maxkey`(9527) + `maxkey_mgt`(9526) 两个 jar，不启 openapi / gateway / Redis |
+| 目标机没有 JDK 21 怎么办 | 包内内置 **jlink 裁剪运行时**（实测 59MB），不依赖目标机 JDK |
+| 内置 JDK 会不会被目标机的 Java 顶掉 | 不会。`maxkeyctl.sh` 把**包内 jre 放在探测顺序第一位**（见 §4.4） |
+| 运行时缺模块会怎样 | `maxkeyctl.sh start` 会**先跑自检**，直接报"缺 java.desktop"这类结论（见 §4.5） |
+| 前端怎么部署 | 纯静态文件，不需要 Node；nginx 指到 `/opt/maxkey/web` 即可 |
+| 公共 nginx 怎么接入 | 新增一个**独立 server 块**的 conf.d 文件，不改别人的站点（见 §6） |
+| 怎么避免影响其他应用 | 独立 `server_name`；只新增 2 个文件；安装脚本检测域名冲突并中止 |
+| SSO 最小化跑哪些进程 | 只跑 `maxkey`(9527) + `maxkey_mgt`(9526)，不启 openapi / gateway / Redis |
+| 数据库 | KingbaseES（实测 V009R003C018）。建库用 0.4MB 的最小种子脚本（见 §9） |
+| 容器化 | 已整条移除，仓库不再保留任何 Dockerfile / compose / k8s 资产 |
 
-**最小化 SSO 拓扑**（不启动 openapi 9525、不启动 gateway 9000、不发 Redis）：
+**最小化拓扑**
 
 ```
-浏览器 ──80──> nginx ──/sign/──────────> maxkey        9527  (SSO 认证中心)
-                  ├──/maxkey/     静态    (登录页, 门户)
-                  └──/maxkey-mgt/ 静态    (管理控制台)
-                          └──/maxkey-mgt-api/──> maxkey_mgt   9526  (管理端 API)
-                                        │
-                                        └──> KingbaseES 54321
+浏览器 ──443──> 公共 nginx ──/maxkey/─────────> 静态文件  /opt/maxkey/web/maxkey
+                   │         ──/maxkey-mgt/────> 静态文件  /opt/maxkey/web/maxkey-mgt
+                   ├──/sign/──────────────> maxkey      127.0.0.1:9527  (认证中心)
+                   └──/maxkey-mgt-api/────> maxkey_mgt  127.0.0.1:9526  (管理端 API)
+                                                    │
+                                                    └──> KingbaseES 54321
 ```
 
 ---
 
 ## 2. 部署包结构
 
-执行 `deployment/kylin/build-package.sh --with-runtime` 生成。
-解包后**统一放到 `/opt/maxkey`**（systemd 单元按此路径写死）：
+`deployment/kylin/build-package.sh` 产出 `maxkey-deploy-<version>.tar.gz`。
 
 ```
-maxkey-kylin-4.2.0/        ← 解包后 mv 成 /opt/maxkey
-├── maxkey/                maxkey-boot-*.jar          ← 认证中心
-├── maxkey_mgt/            maxkey-mgt-boot-*.jar      ← 管理端
+maxkey-deploy-4.2.0/
+├── install.sh                一键落地（幂等，支持 --dry-run）
+├── uninstall.sh              撤销（默认保留配置与数据）
+├── maxkey/                   maxkey-boot-*.jar      ← 认证中心
+├── maxkey_mgt/               maxkey-mgt-boot-*.jar  ← 管理端
 ├── web/
-│   ├── maxkey/            maxkey-web-ng 的 dist/browser
-│   └── maxkey-mgt/        maxkey-web-mgt-ng 的 dist/browser
-├── jre/                   jlink 裁剪运行时（64MB，可选）
-├── conf/maxkey.env        唯一需要改的配置文件
-├── bin/maxkeyctl.sh       启停/状态/诊断
-├── bin/make-runtime.sh    生成内置运行时
-├── bin/preflight.sh       部署前环境自检（glibc/架构/字体/DB/端口）
-├── nginx/                 两套 nginx 片段
-├── systemd/               maxkey-portal.service / maxkey-mgt.service
-└── sql/maxkey.sql         KingbaseES 建库脚本（44 表）
+│   ├── maxkey/               maxkey-web-ng 的 dist/browser
+│   └── maxkey-mgt/           maxkey-web-mgt-ng 的 dist/browser
+├── jre/                      jlink 裁剪运行时（约 59MB，可选但强烈建议）
+├── conf/
+│   ├── maxkey.env            唯一需要改的配置文件
+│   └── maxkey-secret.env.example  数据库口令模板
+├── bin/
+│   ├── maxkeyctl.sh          启停/状态/诊断/运行时自检
+│   ├── make-runtime.sh       生成内置运行时（Temurin 固定版 + sha256）
+│   └── preflight.sh          部署前环境自检
+├── nginx/
+│   ├── maxkey-site.conf      站点配置（独立 server 块）
+│   └── maxkey-proxy.conf     反代公共头
+├── systemd/                  maxkey-portal.service / maxkey-mgt.service
+└── sql/
+    ├── maxkey-seed.sql       KingbaseES 最小种子建库脚本（0.4MB / 44 表）
+    └── make-seed.py          种子脚本生成器（可重新生成与自检）
 ```
-
-`build-package.sh` 从仓库现有产物组装；加 `--build` 会先跑 gradle 与前端构建。
 
 ---
 
-## 3. JDK 21：为什么必须内置
+## 3. 快速开始
 
-### 3.1 硬约束
+```bash
+tar xzf maxkey-deploy-4.2.0.tar.gz
+cd maxkey-deploy-4.2.0
 
-MaxKey 4.2.0 编译目标为 Java 21。实测 jar 内 class 文件魔数为
-`cafe babe 0000 0041`（major 65 = Java 21）。麒麟 V10 自带 JDK 多为 8/11/17，
-直接用会抛 `UnsupportedClassVersionError`。
+# 1. 改配置：必须改的只有这几处
+vi conf/maxkey.env
+#    SERVER_DOMAIN=example.gov.cn                  ← 主域名
+#    MAXKEY_PUBLIC_URL=https://sso.example.gov.cn   ← 对外访问地址（见 §7）
+#    NGINX_SERVER_NAME / NGINX_TLS_PORT / NGINX_CERT / NGINX_KEY
+#    DATABASE_URL / DATABASE_USER
 
-仓库里已有对应修复（[set_maxkey_env.sh:9](../../deployment/shellscript/linux/set_maxkey_env.sh#L9)），
-但该脚本假设 `./jdk-21` 目录已存在，**没有解决“怎么得到 JDK 21”**。本方案补齐这一环。
+# 2. 先演练，确认将要做的事（不需要 root 也能跑）
+./install.sh --dry-run
 
-### 3.2 方案对比
+# 3. 真正落地：建用户、装文件、装 systemd、放 nginx 配置
+sudo ./install.sh
 
-| 方案 | 体积 | 适用 | 问题 |
-|------|------|------|------|
-| A. 要求现场装 JDK 21 | 0 | 有外网/有内网源 | 信创内网常无源；改动目标机 |
-| B. 包内放完整 JDK 21 | ~300MB | 通用 | 包里塞了 2/3 用不到的模块 |
-| **C. 包内放 jlink 裁剪运行时** | **64MB** | **推荐** | 与 CPU 架构绑定；glibc 基线取决于构建所用 JDK（见 §3.4） |
+# 4. 填数据库口令（不在 conf/maxkey.env 里，避免入 git）
+sudo vi /etc/maxkey/maxkey-secret.env     # 仅一行 DATABASE_PWD='实际口令'
+sudo chmod 600 /etc/maxkey/maxkey-secret.env
 
-采用方案 C。
+# 5. 建库
+ksql -U maxkey -d maxkey -f sql/maxkey-seed.sql
 
-> 关于方案 C 的 glibc 顾虑：用 **Adoptium Temurin** 构建时基线仅 `GLIBC_2.15`，
-> 低于麒麟 V10 的 2.28，因此**可直接在普通 x86_64 Linux 上构建**，无需麒麟机器。
-> 详见 §3.4。
+# 6. 环境自检（一次性暴露所有阻塞项）
+sudo ./bin/preflight.sh
 
-### 3.3 模块清单是怎么定的（不要凭经验猜）
+# 7. 启动
+sudo ./bin/maxkeyctl.sh start
+sudo ./bin/maxkeyctl.sh status
 
-直接对 fat jar 做静态分析：
+# 8. 验证
+curl -sk -H 'Host: sso.example.gov.cn' \
+     https://sso.example.gov.cn/sign/authz/oauth/v20/.well-known/openid-configuration
+```
+
+浏览器打开 `https://sso.example.gov.cn/maxkey/`，
+初始账号 **admin / maxkey** —— 上线前必须立即改密，
+并把「机构」的 domain 改成真实域名。
+
+---
+
+## 4. 内置 JDK：为什么必须裁，怎么裁，怎么防被顶掉
+
+### 4.1 硬约束
+
+MaxKey 4.2.0 编译目标是 Java 21（`build.gradle` 里
+`sourceCompatibility/targetCompatibility = VERSION_21`，且低于 21 直接抛
+`GradleException`）。jar 内 class 文件 major 版本 65。
+
+多数信创环境的系统 JDK 是 8/11/17，直接用会抛
+`UnsupportedClassVersionError`。而"让现场先装个 JDK 21"在内网往往做不到。
+
+### 4.2 方案对比
+
+| 方案 | 体积 | 问题 |
+|------|------|------|
+| A. 要求现场装 JDK 21 | 0 | 信创内网常无源；且要改动目标机 |
+| B. 包内放完整 JDK | ~300MB | 2/3 的模块用不到 |
+| **C. 包内放 jlink 裁剪运行时** | **59MB** | 与 CPU 架构绑定；glibc 基线取决于构建所用 JDK（见 §4.3） |
+
+采用 C。
+
+### 4.3 glibc 基线：不必在麒麟上构建
+
+glibc 是向后兼容的：低 glibc 上构建 → 可在高 glibc 运行；反之不行。
+
+实测对比（同一台 Ubuntu 24.04、同一条 jlink 命令）：
+
+| JDK 来源 | `libjvm.so` 要求 | 能否在麒麟 V10(2.28) 运行 |
+|---------|-----------------|--------------------------|
+| Ubuntu 自带 openjdk-21 | `GLIBC_2.38` | 不能 |
+| **Adoptium Temurin 21** | **`GLIBC_2.15`** | **能** |
+
+差异完全来自 JDK 发行版本身（系统打包版会针对当前发行版重新链接）。
+所以真正要控制的是"用哪个 JDK 构建"，不是"在哪台机器构建"。
+
+`bin/make-runtime.sh --download` 会取**固定版本** Temurin 并校验 sha256：
+
+| 项目 | 值 |
+|------|-----|
+| 版本 | `21.0.13+9`（Temurin LTS，实测该 tag 可下载） |
+| x64 sha256 | `d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c` |
+| aarch64 sha256 | `e3522e707fc7dbe2a72c30746b1e7068301a0213ecd213d4491f35a14eb55578` |
+
+不用 `latest` 的原因：`latest` 会随时间漂移，同一提交在不同月份构建出的包
+不一致，不可复现；且没有 sha256 就无法确认下到的是官方产物。
+
+缓存两级（实测二次构建 4 秒，首次 91 秒）：
+`$TEMURIN_CACHE` > `<包根>/.cache/temurin` > `~/.cache/temurin`。
+
+### 4.4 内置运行时如何不被目标机 JDK 顶掉
+
+`maxkeyctl.sh` 的 `find_java()` 探测顺序（**顺序是刻意的**）：
+
+```
+0) MAXKEY_JAVA            显式强制（排障用）
+1) <包根>/jre/bin/java    ← 内置运行时优先
+2) JAVA_HOME
+3) /usr/lib/jvm/*21* /opt/jdk-21* ...
+4) PATH 中的 java
+```
+
+内置运行时排第一，因为本方案要解决的正是"目标机 Java 版本不可控"。
+若让 `JAVA_HOME`/`PATH` 优先，目标机上一个残缺 JDK 就会顶掉内置运行时，
+打包内置 JDK 的努力全部作废，而失败现象会变成难以归因的
+`UnsupportedClassVersionError`。
+
+需要强制用外部 JDK 时：`MAXKEY_JAVA=/path/to/java ./bin/maxkeyctl.sh start`
+或删掉 `jre/` 目录。
+
+### 4.5 模块清单与运行时自检
+
+模块清单不是凭经验敲的，而是对 fat jar 做静态分析：
 
 ```bash
 unzip -q maxkey-boot-4.2.0-ga.jar 'BOOT-INF/lib/*.jar' 'BOOT-INF/classes/*'
@@ -89,356 +189,157 @@ jdeps --print-module-deps --multi-release 21 \
       --class-path "BOOT-INF/lib/*" BOOT-INF/classes
 ```
 
-结果：`java.base,java.compiler,java.desktop,...,jdk.unsupported`
-
-在此基础上做了两处**实测修正**（这一步不能省）：
+在此基础上做了两处**实测修正**（不能省）：
 
 1. **必须保留 `java.desktop`**
-   验证码走 `java.awt.image.BufferedImage`。去掉后启动即失败：
-   ```
-   NoClassDefFoundError: java/beans/PropertyChangeEvent
-   ```
-   这正是 `java.desktop` 里的 `java.beans`。换来的代价是它依赖系统字体，
-   已验证 headless 下字体渲染正常（`-Djava.awt.headless=true` 时
-   `GraphicsEnvironment` 仍能列出 35 个字体族，验证码 PNG 正常输出 120x40）。
+   验证码走 `java.awt.image.BufferedImage`，二维码同理。
+   去掉后启动即失败：`NoClassDefFoundError: java/beans/PropertyChangeEvent`
+   （`java.beans` 在 `java.desktop` 里）。
+   代价是它依赖系统字体；已实测 headless 下验证码 PNG 正常输出。
 
 2. **可以去掉 `jdk.attach` / `jdk.jdi` / `jdk.jfr`**
-   jdeps 因间接引用报出，但实测启动与登录均不需要，省约 20MB。
+   jdeps 因间接引用报出，但实测启动与登录都不需要，省约 20MB。
 
-另外补齐了几个 jdeps **看不到**的模块——它们通过反射/SPI 在运行期加载：
+另外补齐几个 jdeps **看不到**的模块（通过反射/SPI 在运行期加载）：
 
 | 模块 | 为什么需要 |
 |------|-----------|
 | `java.sql` `java.transaction.xa` | JDBC 驱动、连接池 |
 | `java.naming` | LDAP / JNDI（同步器） |
 | `java.management` | JMX、Druid 监控 |
-| `java.security.sasl` `java.security.jgss` | SCRAM 认证、Kerberos 登录 |
+| `java.security.sasl` `java.security.jgss` | SCRAM 认证、Kerberos |
 | `jdk.crypto.ec` | TLS 椭圆曲线套件 |
-| `jdk.charsets` `jdk.localedata` | GB18030/GBK 与中文时区（`--include-locales=zh,en`） |
-| `jdk.zipfs` | 嵌套 jar 读取 |
+| `jdk.charsets` `jdk.localedata` | GB18030/GBK 与中文（`--include-locales=zh,en`） |
+| `jdk.zipfs` | 嵌套 jar 读取（Spring Boot 的 FileSystemProvider） |
 
-### 3.4 生成运行时：不需要在麒麟上构建
-
-**先给结论**：不需要在麒麟上构建，也不需要"测试麒麟出包、生产麒麟运行"。
-只要用**低 glibc 基线**的 JDK 发行版构建一次，产物就能在麒麟 V10 上直接跑。
-
-#### 为什么（glibc 是向后兼容的）
-
-glibc 的符号版本机制保证了：
+**运行时自检**：`maxkeyctl.sh start` 在启动前用待启动的那个 java 跑一段
+探针，引用 `java.desktop / java.sql / java.naming / java.management /
+java.security.jgss / java.prefs`。缺模块时直接给出结论，例如实测输出：
 
 ```
-低 glibc 上构建的产物  →  可在高 glibc 运行   ✅
-高 glibc 上构建的产物  →  不能 在低 glibc 运行 ❌
+ERROR: 内置运行时自检未通过 —— jlink 裁剪的 jre 缺少必需模块。
+       运行时: /tmp/sctest/jre/bin/java
+       缺失线索:
+         Exception in thread "main" java.lang.NoClassDefFoundError: java/awt/image/BufferedImage
+       判定: 缺 java.desktop（验证码/二维码渲染必须，去掉会导致登录页崩溃）。
+       修复: ./bin/make-runtime.sh --download
 ```
 
-实测对比（同一台 Ubuntu 24.04 机器上）：
+为什么值得加这一步：缺模块的报错是 `ClassNotFoundException` /
+`NoClassDefFoundError`，堆栈很深且指向的不是真正的缺失点；而且实测这类异常
+**只在渲染验证码时才触发** —— 服务已经"启动成功"、运维以为没事了，
+等用户第一次打开登录页才炸。
 
-| JDK 来源 | `libjvm.so` 需要 | 能否在麒麟 V10 (2.28) 运行 |
-|---------|-----------------|--------------------------|
-| Ubuntu 自带的 `openjdk-21-jdk` | `GLIBC_2.38` | ❌ 不能 |
-| **Adoptium Temurin 官方 JDK 21** | **`GLIBC_2.15`** | ✅ **能** |
-
-两者是同一台机器、同一个 jlink 命令，差异**完全来自 JDK 发行版本身**——
-系统打包版会针对当前发行版重新链接，官方通用构建则保持低基线。
-
-所以真正要控制的是"用哪个 JDK 构建"，不是"在哪台机器构建"。
-
-#### 推荐做法：用固定版 Temurin 构建（带本地缓存）
-
-```bash
-# 一条命令：自动取固定版 Temurin，带缓存，然后 jlink
-./bin/make-runtime.sh --download
-
-# 已有 Temurin 时跳过下载，直接指定
-JAVA_HOME=/opt/temurin21 ./bin/make-runtime.sh
-```
-
-**版本是写死的，不用 `latest`**：
-
-| 项目 | 值 |
-|------|-----|
-| 版本 | `21.0.13+9`（Temurin LTS） |
-| x64 sha256 | `d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c` |
-| aarch64 sha256 | `e3522e707fc7dbe2a72c30746b1e7068301a0213ecd213d4491f35a14eb55578` |
-
-为什么固定而不用 `latest`：
-
-- `latest` 会随时间漂移 —— 同一个提交在不同月份构建出的包不一致，**不可复现**
-- 有固定 sha256 才能校验"下到的确实是 Temurin 官方产物"，防中间人与镜像投毒
-- 升级时机可控（改 `JDK_TAG` + 两个 sha256，四项一起改）
-
-#### 两级缓存：第二次构建从 91 秒降到 4 秒
-
-脚本在**运行脚本的这台机器**上缓存，不再每次走网络：
-
-```
-<缓存根>/jdk-21.0.13+9/
-├── OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz   ← 压缩包（199MB）
-└── x64/                                                 ← 解压后的 JDK（346MB）
-```
-
-命中顺序：
-
-1. **`x64/` 存在且含 `bin/jlink`** → 直接复用，**完全不联网**（实测 4 秒）
-2. **只有 `.tar.gz`** → 先校验 sha256，通过则解压复用，不联网（实测 6 秒）
-3. **都没有** → 下载 → 校验 → 缓存 → 解压（实测 91 秒）
-
-实测耗时对比：
-
-| 场景 | 耗时 | 是否联网 |
-|------|------|---------|
-| 首次（缓存未命中） | **1 分 31 秒** | 是（199MB） |
-| 二次（命中已解压） | **4.2 秒** | 否 |
-| 二次（仅命中压缩包） | **6.0 秒** | 否 |
-
-缓存根目录按优先级：
-
-```bash
-$TEMURIN_CACHE                     # 显式指定，适合 CI 挂载共享盘
-<包根>/.cache/temurin              # 默认（已加入 .gitignore，不入库）
-~/.cache/temurin                   # 包目录不可写时兜底
-```
-
-管理命令：
-
-```bash
-./bin/make-runtime.sh --clean-cache     # 清空缓存（545MB），强制重新下载
-TEMURIN_CACHE=/data/ci-cache ./bin/make-runtime.sh --download   # 团队/CI 共享缓存
-```
-
-**缓存损坏会自动恢复**：脚本读到压缩包先验 sha256，不符则丢弃重下，
-并打印期望值与实际值。下载过程写 `.part` 临时文件，校验通过才改名，
-避免半截文件被当成有效缓存。
-
-#### 出包前自动拦截高基线 JDK
-
-`make-runtime.sh` 会**自动校验**产物基线并在不合格时拒绝出包：
-
-```
-产物需要   : glibc 2.38
-目标基线   : glibc 2.28（麒麟 V10 默认）
-[FAIL] 该 JDK 产物需要 glibc 2.38，高于目标 2.28
-```
-
-合格时：
-
-```
-产物需要   : glibc 2.15
-目标基线   : glibc 2.28（麒麟 V10 默认）
-[ OK ] 产物需 glibc 2.15，目标 2.28 满足，可在麒麟运行
-```
-
-目标机 glibc 实际更高时（某些麒麟 V10 SP3 补丁版本）可覆盖：
-
-```bash
-TARGET_GLIBC=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$') ./bin/make-runtime.sh --download
-```
-
-#### 如果内网无外网
-
-**最省事的方式**：利用缓存机制，只把压缩包搬进去。
-
-在可联网机器上（与目标同架构）：
-
-```bash
-# 固定版本，与脚本内一致
-curl -fL -o OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz \
-  "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz"
-
-# 校验（必须与脚本内 sha256 一致）
-sha256sum OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz
-# d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c
-```
-
-拷贝到内网后放进缓存目录，脚本会**自动识别并跳过下载**：
-
-```bash
-mkdir -p <包根>/.cache/temurin/jdk-21.0.13+9
-cp OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz \
-   <包根>/.cache/temurin/jdk-21.0.13+9/
-./bin/make-runtime.sh --download      # 校验→解压→jlink，全程不联网
-```
-
-也可以直接解压一份 Temurin 指过去（不走缓存）：
-
-```bash
-mkdir -p /opt/temurin21
-tar xzf OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz -C /opt/temurin21 --strip-components=1
-JAVA_HOME=/opt/temurin21 ./bin/make-runtime.sh
-```
-
-> 注意：`--download` 在离线环境**不会卡住等待网络**——只要压缩包已在缓存目录且
-> sha256 通过，它就直接走解压分支。若校验失败才会尝试下载。
-
-#### 三条替代路径（都不需要构建）
-
-| 场景 | 做法 |
-|------|------|
-| 目标机已装任意 JDK 21（含毕昇/龙芯 JDK） | `export JAVA_HOME=/usr/lib/jvm/xxx`，脚本优先用它，**根本不需要 jre** |
-| 目标机可联网且有内网 yum 源 | `yum install java-21-openjdk`，同上 |
-| 完全离线且无任何 JDK | 用上面的离线拷贝方式 |
-
-#### 仍需注意的唯一绑定：CPU 架构
-
-`jre` 与 CPU 架构绑定，与 glibc 无关：
-
-- `x86_64` 的产物不能用在 `aarch64` / 龙芯 / 申威
-- 必须**按目标架构**各出一份（`make-runtime.sh --download` 会自动识别 `uname -m`）
-
-麒麟常见架构：`x86_64`（大多数）、`aarch64`（飞腾/鲲鹏）。
-
-> 参考：[Adoptium 关于 glibc 需求的讨论](https://github.com/adoptium/adoptium-support/issues/918)
-
-### 3.5 探测顺序
-
-`maxkeyctl.sh` 的优先级（`find_java()`）：
-
-1. `$JAVA_HOME`（**会校验主版本 ≥ 21**，低于 21 时打印告警并继续找）
-2. `<包根>/jre/bin/java`（内置运行时）
-3. `/usr/lib/jvm/*21*`、`/opt/jdk-21*`、`/usr/java/jdk-21*`
-4. `PATH` 中的 `java`
-
-诊断命令：
-
-```bash
-./bin/maxkeyctl.sh java
-# java      = /opt/maxkey/jre/bin/java
-# major     = 21
-# JAVA_HOME = <未设置>
-```
+> 实现注意：自检**不能**用 `java Probe.java` 单文件源码模式。
+> 那依赖 `jdk.compiler`，而裁剪掉的运行时正好没有，会先报
+> `Module jdk.compiler not in boot Layer`，把真正缺失的模块信息盖掉。
+> 所以用 `javac` 预编译成 `.class` 再用 `-cp` 运行。
 
 ---
 
-## 4. 前端在麒麟上怎么跑
+## 5. 前端：纯静态，不需要 Node
 
-### 4.1 关键结论：麒麟上不需要 Node
+两个 Angular 应用构建产物是 `dist/browser`，由 nginx 直接托管。
 
-前端是 Angular 编译产物（HTML/JS/CSS 静态文件）。**构建在开发机完成，目标机只放文件**。
-麒麟上不需要装 Node、pnpm、Angular CLI，也不需要 `ng serve`。
+| 前端 | base-href | 访问地址 | 托管方 |
+|------|-----------|---------|--------|
+| portal | `/maxkey/` | `https://<域>/maxkey/#/passport/login` | nginx 静态 |
+| 管理端 | `/maxkey-mgt/` | `https://<域>/maxkey-mgt/` | nginx 静态 |
+| portal API | — | `/sign/` → 9527 | `maxkey` jar |
+| 管理端 API | — | `/maxkey-mgt-api/` → 9526 | `maxkey_mgt` jar |
 
-构建命令（仅构建机执行）：
+三个要点：
+
+* **前端不在任何 jar 里**。`maxkey-starter-web-static` 只有
+  `favicon.ico` 和 jquery，`index.html` 数量为 0。所以 nginx 托管是唯一方式。
+* **API 用同源相对路径**。`environment.prod.ts` 里 `baseUrl` 是
+  `/sign/` 与 `/maxkey-mgt-api/`，因此 nginx 单入口即可，**不需要 CORS**。
+* 路由是 **hash 模式**（`useHash: true`），`#...` 不会发到服务端；
+  但直接粘贴的无 hash 深链接仍需要 SPA 回退到 `index.html`。
+
+构建（构建机执行，需 node 22.23.2 + pnpm）：
 
 ```bash
 cd maxkey-web-frontend/maxkey-web-ng
-pnpm install --frozen-lockfile
-pnpm run build:prod        # ng b --configuration production --base-href /maxkey/
+pnpm install --frozen-lockfile && pnpm run build:prod   # --base-href /maxkey/
 
 cd ../maxkey-web-mgt-ng
-pnpm install --frozen-lockfile
-pnpm run build:prod        # ng b --configuration production --base-href /maxkey-mgt/
+pnpm install --frozen-lockfile && pnpm run build:prod   # --base-href /maxkey-mgt/
 ```
 
-产物在各自的 `dist/browser/`。`build-package.sh` 会自动拷到 `web/maxkey/` 与 `web/maxkey-mgt/`。
-
-> 构建机需要 Node 22（见 `maxkey-web-ng/.nvmrc`）与 pnpm 12。
-
-### 4.2 为什么路径前缀是 `/maxkey/` 和 `/maxkey-mgt/`
-
-这不是随便定的，而是编译期烧进 `index.html` 的 `<base href>`，并与后端对齐：
-
-| 前端 | base-href | 后端 API 前缀 | 后端 context-path |
-|------|-----------|--------------|-------------------|
-| 认证中心 | `/maxkey/` | `/sign/` | `/sign` |
-| 管理端 | `/maxkey-mgt/` | `/maxkey-mgt-api/` | `/maxkey-mgt-api` |
-
-`baseUrl` 写在 `environment.prod.ts`（[认证中心](../../maxkey-web-frontend/maxkey-web-ng/src/environments/environment.prod.ts)、[管理端](../../maxkey-web-frontend/maxkey-web-mgt-ng/src/environments/environment.prod.ts)）。
-**改前缀要连 nginx 一起改**，三者必须一致。
-
-### 4.3 路由是 hash 模式，这简化了 nginx
-
-两个前端都是 `useHash: true`，即 `http://host/maxkey/#/passport/login`。
-`#` 之后的内容浏览器不会发给服务器，所以**不存在“刷新 404”问题**。
-
-仍保留 `try_files` 回退的原因：`index.html` 用 `<base href="./">`，
-且用户可能直接粘贴无 hash 的深链接（如 `/maxkey/passport/login`）。
+两个前端的 `pnpm-lock.yaml` 已入库。版本口径固定为
+**node 22.23.2 / pnpm 12.6.0**（Angular 22.2.0 的 engines 是
+`^22.22.3 || ^24.15.0 || >=26.0.0`，24.14.0 不满足）。
 
 ---
 
-## 5. nginx：单独启动，还是合并进已有的？
+## 6. nginx：接进公共实例，不影响其他应用
 
-### 5.1 先决判断
+### 6.1 设计取舍
 
-```bash
-# 目标机上是否已有 nginx 在跑？
-systemctl is-active nginx 2>/dev/null || ps -ef | grep -c "[n]ginx: master"
-ss -lntp | grep -E ':(80|443)\b'
+目标机 nginx 是公共的，本机实测 80 端口已被另一个站点占用
+（`listen 80; server_name localhost;`）。三种做法里选第三种：
+
+| 做法 | 问题 |
+|------|------|
+| 另起一个 nginx 实例 | 多一个进程、多一套配置要维护 |
+| 往别人的 `server{}` 里塞 location | Cookie 作用域与对方重叠；对方改配置会牵连 MaxKey |
+| **新增独立 server 块（conf.d 一个文件）** | **选用**。隔离干净，升级只替换自己的文件 |
+
+具体形态：`conf.d/maxkey.conf` + `/etc/nginx/maxkey-proxy.conf`，
+共 2 个文件，**不触碰任何已有站点文件**。
+
+### 6.2 安装位置
+
+```
+/etc/nginx/conf.d/maxkey.conf      ← 站点配置（server 块）
+/etc/nginx/maxkey-proxy.conf       ← 反代公共头（被两个 location include）
 ```
 
-- **没有 nginx** → 用方案 A（独立站点），装 nginx 包即可
-- **已有 nginx 且 80 端口被占用** → 用方案 B（合并），**不必为此再起一个实例**
-- **已有 nginx 但端口/目录完全隔离（如容器化）** → 也可用方案 A
-
-### 5.2 方案 A：独立 nginx 站点
+`install.sh` 自动完成渲染与校验；手工安装时：
 
 ```bash
-cp nginx/maxkey-standalone.conf  /etc/nginx/conf.d/maxkey.conf
-cp nginx/maxkey-proxy.conf       /etc/nginx/maxkey-proxy.conf
-mkdir -p /opt/maxkey/web
-cp -a web/maxkey web/maxkey-mgt /opt/maxkey/web/
+cp nginx/maxkey-site.conf /etc/nginx/conf.d/maxkey.conf
+cp nginx/maxkey-proxy.conf /etc/nginx/maxkey-proxy.conf
 nginx -t && nginx -s reload
 ```
 
-`maxkey-standalone.conf` 里 `root /opt/maxkey/web;`，靠 URI 前缀 `/maxkey/`
-天然对上子目录，**不需要 alias**。
-
-### 5.3 方案 B：合并进已有 nginx（推荐）
-
-**不新建 server 块**，把 `nginx/maxkey-into-existing.conf` 的内容追加到
-现有站点的 `server { }` 内部，或存成独立文件后 `include`：
-
-```nginx
-server {
-    listen 80;
-    server_name your-existing-site.gov.cn;
-    root /var/www/your-site;          # 别人的根目录，不能动
-
-    # ... 原有配置 ...
-
-    include /etc/nginx/maxkey-locations.conf;   # ← 只加这一行
-}
-```
-
-推荐 `include` 而非直接粘贴：升级 MaxKey 时只替换被 include 的文件，不碰别人的配置。
-
-#### 三个必须避开的坑（都是实测出来的）
+### 6.3 四个必须避开的坑（都是实测出来的）
 
 **坑 1：不能用 `alias` + `try_files`**
-
-原先以为这样更“干净”：
 
 ```nginx
 location /maxkey/ {
     alias /opt/maxkey/web/maxkey/;
-    try_files $uri $uri/ /maxkey/index.html;   # ← 错
+    try_files $uri $uri/ /maxkey/index.html;   # 错
 }
 ```
 
-实测结果：`/maxkey/` 返回 200，但**深链接和 assets 全部 404**。
+实测表现：`/maxkey/` 返回 200，但**深链接和 assets 全部 404**。
 nginx 的 `alias` 与 `try_files` 组合有已知缺陷。
 
-正确写法——用 `root`，让 URI 前缀自然映射到子目录：
+正确写法是用 `root`，让 URI 前缀自然映射到子目录：
 
 ```nginx
 location /maxkey/ {
-    root /opt/maxkey/web;                       # 注意：指向父目录
+    root /opt/maxkey/web;        # 指向父目录
     try_files $uri $uri/ /maxkey/index.html;
 }
 ```
 
-因为 `root` + URI `/maxkey/x.js` = `/opt/maxkey/web/maxkey/x.js`，
-子目录名恰好等于 URI 前缀，所以不需要 `alias`。
+`root` + URI `/maxkey/x.js` = `/opt/maxkey/web/maxkey/x.js`，
+子目录名恰好等于 URI 前缀，因此不需要 `alias`。
 
-**坑 2：静态资源缺失必须真 404，不能回退到 index.html**
+**坑 2：静态资源缺失必须真 404**
 
 ```nginx
 location ^~ /maxkey/assets/ {
     root /opt/maxkey/web;
-    try_files $uri =404;      # ← =404 而不是 /maxkey/index.html
-    expires 7d;
+    try_files $uri =404;         # 不是 /maxkey/index.html
 }
 ```
 
-若回退到 `index.html`，浏览器会以 `text/html` 解析 `.js`，报
+若回退到 `index.html`，浏览器会把 `.js` 当 `text/html` 解析，报
 `Unsupported MIME type` / `Unexpected token '<'`，排查成本极高。
 `^~` 前缀保证它优先于后面的 SPA 回退。
 
@@ -446,506 +347,587 @@ location ^~ /maxkey/assets/ {
 
 ```nginx
 location /sign/ {
-    proxy_pass http://127.0.0.1:9527/sign/;    # ← 必须有尾部斜杠和 /sign
+    proxy_pass http://127.0.0.1:9527/sign/;   # 必须有尾斜杠和 /sign
 }
 ```
 
-后端 context-path 是 `/sign`，前端 `baseUrl` 是 `/sign/`。
-写成 `proxy_pass http://127.0.0.1:9527;` 会丢路径前缀，所有 API 404。
+后端 context-path 是 `/sign`。写成 `proxy_pass http://127.0.0.1:9527;`
+会丢路径前缀，所有 API 404。
 
-#### 实测结果（隔离实例，端口 18090）
+**坑 4：不要重复声明同 `server_name` + 同端口的 80 站点**
 
-| 请求 | 结果 |
-|------|------|
-| `/maxkey/` | 200 index.html |
-| `/maxkey/passport/login` | 200 index.html（回退生效） |
-| `/maxkey/assets/a.js` | 200 静态文件 |
-| `/maxkey/assets/nope.js` | **404**（未误回退） |
-| `/maxkey-mgt/dashboard` | 200 |
-| `/sign/inst/get` | 200 透传到后端 |
+两个同名 server 会让 nginx 报 `conflicting server name`，
+且**实际生效的是先加载的那个** —— 表现为"改了配置但不生效"。
+`install.sh` 会在安装前扫描 `conf.d`，命中冲突直接中止（实测在本机
+正确命中了已有的 `sso-sso.lottery-dev.com.conf`）。
 
-### 5.4 反代必须带的头
+需要"80 跳 443"时，在**已有的**那个 80 server 里加 `return 301`，
+不要在 MaxKey 的站点文件里新建同名 server。
 
-见 `nginx/maxkey-proxy.conf`。其中两个不是“锦上添花”而是功能必需：
+### 6.4 反代必须带的头
 
-- **`Host`**：后端 [WebInstRequestFilter.java:58-67](../../maxkey-starter/maxkey-starter-web/src/main/java/org/dromara/maxkey/web/WebInstRequestFilter.java#L58-L67)
-  用 `Host` 头查租户（机构）。丢了域名，多租户全部退回默认租户。
-- **`X-Forwarded-Proto` / `X-Forwarded-Port`**：OIDC 元数据端点用
-  `WebContext.getContextPath()` 从**当前请求**推导 URL。不传这些头，
-  会发现文档里出现 `http://127.0.0.1/sign/...` 这类内网地址。
+见 `nginx/maxkey-proxy.conf`。其中三个不是锦上添花而是功能必需：
+
+* **`Host`** —— 后端 `WebInstRequestFilter` 用 Host 头（或 `hostname` 头）
+  查租户（机构）。丢了域名，多租户全部退回默认租户。
+* **`X-Forwarded-Proto` / `X-Forwarded-Port`** —— 后端
+  `server.forward-headers-strategy=NATIVE` 靠它们还原对外 scheme/port。
+  不传会让 OIDC 元数据里出现 `http://127.0.0.1:9527/sign` 这类内网地址。
+* **`proxy_redirect off`** —— SSO 回跳全靠 `Location`，
+  不能让 nginx 改写。
 
 实测对比（同一后端，只改请求头）：
 
 ```
-无 Host（默认）      → issuer = http://127.0.0.1/sign/maxkey
-Host: sso.xxx.local  → issuer = http://sso.xxx.local/sign/maxkey
+无 X-Forwarded-*          → authorization_endpoint = http://127.0.0.1:9527/sign/...
+带 X-Forwarded-Proto/Port → authorization_endpoint = https://sso.<域>:<端口>/sign/...
 ```
 
-### 5.5 HTTPS
+### 6.5 HTTPS 与证书
 
-若前端用 https 反代，还需在 `conf/maxkey.env` 改：
+站点配置默认监听 443 + TLS 1.2/1.3，证书路径由 `conf/maxkey.env` 的
+`NGINX_CERT` / `NGINX_KEY` 指定（指向**现场已有证书**，不复制私钥副本，
+轮换时只改一处）。
 
-```bash
-MAXKEY_SCHEME=https
-```
-
-因为 `maxkey.server.scheme` 在 properties 里写死为 `http`
-（[application-maxkey.properties:33](../../maxkey-webs/maxkey-web-maxkey/src/main/resources/application-maxkey.properties#L33)），
-脚本用 `-Dmaxkey.server.scheme=...` 覆盖。
-
-注意：Passkey/WebAuthn 的 allowed-origins 也需同步改
-（`maxkey.login.passkey.relying-party.*`），否则生物识别登录会失败。
+`install.sh` 会校验 `MAXKEY_PUBLIC_URL` 的 host 与 port 同
+`NGINX_SERVER_NAME` / `NGINX_TLS_PORT` 一致，不一致直接拒绝安装。
 
 ---
 
-## 6. 后端启动
+## 7. 对外地址：`MAXKEY_PUBLIC_URL` 是唯一入口
 
-### 6.1 配置
+这是整套配置里最容易搞错、也最容易出"能登录但立刻掉线"的地方。
 
-只需改 `conf/maxkey.env`。三个**容易踩的结构性坑**已在该文件内注明：
+后端有**两处**需要"对外地址"，但取法完全不同：
 
-1. **JDBC URL 必须加引号**——`&` 是 shell 的后台分隔符。
-   裸写会让 `DATABASE_URL` 变成空串，应用静默回落到内置 MySQL 默认值，
-   表现为“配了 Kingbase 却连 3306”。
-2. **`DATABASE_COLUMN_ESCAPE_CHAR` 用单引号包裹一个双引号**——
-   Kingbase 在 MySQL 兼容模式下 `online` 是保留字，必须用双引号转义标识符。
-3. **端口用 `PORTAL_PORT`/`MGT_PORT`**，脚本会翻译成 `SERVER_PORT` 分别下发
-   （两个应用端口不同，不能共用同一个环境变量）。
+| 用途 | 取值方式 | 可否请求推导 |
+|------|---------|-------------|
+| JWT 的 `iss`（`maxkey.auth.jwt.issuer` ← `maxkey.server.uri`） | **固定配置值** | **不能** |
+| OIDC 元数据 `issuer` / 各 `*_endpoint` | 由当前请求推导 | 必须（见 §7.2） |
 
-`maxkeyctl.sh` 会对第 1 类错误做**显式校验**并在启动前报错退出，
-而不是让它静默生效。
+### 7.1 JWT 的 iss 必须是固定值
 
-#### 数据库口令：不落在配置文件里
+`JwtLoginService.jwtTokenValidation()` 对 iss 做的是
+`jwtClaimsSet.getIssuer().equals(getIssuer())` —— **严格相等**比对
+（源码第 91 行）。签发（`AuthTokenService`）与校验必须取同一个值。
 
-`conf/maxkey.env` 是**被 git 跟踪的模板**。若在其中填明文口令，
-`git add` 会把口令永久写入提交历史，事后删除也无法真正抹除。
-因此口令改为运行期注入，配置文件里只有一行继承：
+若让它随请求 Host 推导，同一实例经不同入口访问就会签出不同 iss，
+token 互不认，表现为"登录成功但立刻被踢回登录页"。
 
-```bash
-DATABASE_PWD="${DATABASE_PWD:-}"
+历史实现的错误在这里：`maxkey.server.uri` 原为
+
+```
+${maxkey.server.name}:${server.port}${server.servlet.context-path}
 ```
 
-三种注入方式（按推荐度）：
+把**内部端口 9527** 拼进了对外 URL。放在 nginx 后面时签出的 iss 是
+`http://sso.<域>:9527/sign`，浏览器的实际 origin 却是
+`https://sso.<域>/sign`，两边不一致 → token 判定无效。
 
-| 方式 | 做法 | 适用 |
-|------|------|------|
-| **独立密钥文件**（推荐） | `/etc/maxkey/maxkey-secret.env`，600 root:root，systemd 单元已引用 | 生产 |
-| systemd 内联 | 单元里 `Environment="DATABASE_PWD=..."`（单元需 600） | 临时 |
-| 环境变量 | `export DATABASE_PWD=... && ./bin/maxkeyctl.sh start` | 调试 |
+现在改为：
 
-密钥文件模板见 `conf/maxkey-secret.env.example`，格式要求：
-
-- 每行 `KEY=VALUE`，**不要写 `export`**
-- 口令含 `$` `` ` `` `\` `"` 时**必须用单引号**包裹，否则会被变量展开
-- systemd 对单引号的处理与 POSIX shell 一致（剥掉引号），
-  所以 `DATABASE_PWD='p@ss'` 传给进程的是 `p@ss`
-
-> 未注入时 `maxkeyctl.sh` 会在启动前显式报错并给出注入指引，
-> 不会让你带着空口令去撞一个 `password authentication failed`。
-
-### 6.2 启动
-
-```bash
-./bin/maxkeyctl.sh start          # 两个都起
-./bin/maxkeyctl.sh start portal   # 只起认证中心
-./bin/maxkeyctl.sh status
-./bin/maxkeyctl.sh stop
+```
+maxkey.public.url = ${MAXKEY_PUBLIC_URL:http://sso.${SERVER_DOMAIN}}
+maxkey.server.uri = ${maxkey.public.url}/sign           # portal
+maxkey.server.uri = ${maxkey.public.url}/maxkey-mgt-api # mgt
 ```
 
-脚本在启动后会**轮询端口**直到就绪才返回成功，避免
-“脚本说成功了但进程已退出”的假成功。
+> 键名**故意不叫** `MAXKEY_PUBLIC_URL`。若键名与占位符同名，
+> 就是 `MAXKEY_PUBLIC_URL=${MAXKEY_PUBLIC_URL:...}` 自引用，
+> Spring 的占位符解析会陷入循环引用。
 
-实测启动耗时：**6–8 秒**（jlink 运行时 64MB，已导入 44 表）。
-已从 `/`（根目录）以无 `JAVA_HOME` 的方式验证过，日志正确落在应用目录。
-`start` 返回成功即代表端口已监听，可直接用于自动化脚本。
+### 7.2 OIDC 元数据必须按请求推导
 
-### 6.3 systemd 托管
+OIDC 元数据由 `WebContext.getContextPath(true)` 生成，内部走
+`UrlUtils.buildFullRequestUrl(request)`，取的是**当前请求**的
+scheme/port/host。
+
+因此后端开了 `server.forward-headers-strategy=NATIVE`
+（Tomcat `RemoteIpValve`），配合 nginx 传 `X-Forwarded-*`。
+
+选 `NATIVE` 而非 `FRAMEWORK`：前者在连接器层生效，
+`getScheme()`/`getServerPort()`/`getRemoteAddr()` 三者都正确；
+后者是 Servlet Filter，覆盖范围取决于 filter 顺序，更容易漏。
+
+顺带修好第三个问题：登录日志里的客户端 IP 不再全是 `127.0.0.1`。
+
+### 7.3 两处必须一致
+
+| 配置 | 决定什么 | 必须等于 |
+|------|---------|---------|
+| `MAXKEY_PUBLIC_URL` | JWT iss、登录页/门户跳转、登出回跳 | 浏览器实际访问的根地址 |
+| nginx `server_name` + `listen` | OIDC 元数据推导 | 同上 |
+
+实测两者一致时：JWT 的 iss 是
+`https://sso.lottery-dev.com:9443/sign`，
+OIDC issuer 是 `https://sso.lottery-dev.com:9443/sign/maxkey`，同源同端口。
+
+### 7.4 迁移到不同端口/协议
+
+`MAXKEY_PUBLIC_URL` 是纯配置项，改完重启即可，**不需要重新打包**：
 
 ```bash
-useradd -r -s /sbin/nologin maxkey
-chown -R maxkey:maxkey /opt/maxkey
-cp systemd/*.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now maxkey-portal maxkey-mgt
-journalctl -u maxkey-portal -f
+# 例如从 9443 迁到标准 443
+vi /opt/maxkey/conf/maxkey.env
+#   MAXKEY_PUBLIC_URL=https://sso.example.gov.cn
+#   NGINX_TLS_PORT=443
+sudo ./install.sh          # 重新渲染 nginx 站点配置
+sudo ./bin/maxkeyctl.sh restart
 ```
-
-`maxkey-mgt.service` 声明了 `Requires=maxkey-portal.service`——
-管理端登录走 CAS，依赖认证中心。
-
-### 6.4 日志
-
-应用日志由 log4j2 输出到 `logs/maxkey.log`（相对路径，所以脚本会
-`cd` 到应用目录再启动，否则日志会散落到调用者当前目录）。
-
-`logs/nohup-*.out` 存放 stdout/stderr。脚本会在超过 50MB 时自动轮转——
-这一点是踩坑加的：一次排障中该文件涨到 **14GB** 并耗尽磁盘。
 
 ---
 
-## 7. 域名在本项目里如何起作用
+## 8. 域名在本项目里的三个作用
 
-这是三个**互相独立**的作用，很容易混为一谈。
+域名不只是"访问地址"，改错会引发三类互不相关的故障：
 
-### 7.1 作用一：租户（机构）识别 —— 按 `Host` 头查库
+### 8.1 租户（机构）识别
 
-请求进来后，`WebInstRequestFilter` 取 `Host` 头，去掉端口，去
-`mxk_institutions` 表按 `id` / `domain` / `consoledomain` 三列查：
+`WebInstRequestFilter` 用 `Host` 头（优先 `hostname` 头）查
+`mxk_institutions.domain`：
 
-```sql
--- InstitutionsMapper.java:26
-select * from mxk_institutions
-where (id = ? or domain = ? or consoledomain = ?) and status = 1
+```java
+String host = request.getHeader("hostname");
+if (isEmpty(host)) host = request.getHeader("host");
+if (isEmpty(host)) host = applicationConfig.getDomainName();
+if (host.indexOf(":") > -1) host = host.split(":")[0];
+Institutions institution = institutionsService.get(host);
 ```
 
-查到的机构放进 Session 的 `current_inst`，之后登录页标题、Logo、
-验证码策略、社交登录配置都按这个机构取。
-
-实测（`mxk_institutions` 中 `domain='sso.kylin-test.local'`）：
-
-```
-Host: sso.kylin-test.local   → 命中，inst id=1, domain=sso.kylin-test.local
-Host: mgt.kylin-test.local   → 命中（consoledomain），inst id=1
-Host: random.example         → 未命中，回退默认 inst id=1
-Host: (无)                   → 使用 maxkey.server.domain 配置值
-```
-
-**两个要点**：
-
-- **未命中不报错，静默回退默认机构（id=1）**。所以单租户场景下
-  域名配错不会报错，只会“看起来正常但用的是默认配置”——很隐蔽。
-- **机构有 60 分钟 Caffeine 缓存**（[InstitutionsServiceImpl.java:42](../../maxkey-persistence/src/main/java/org/dromara/maxkey/persistence/service/impl/InstitutionsServiceImpl.java#L42)）。
-  改了 `mxk_institutions.domain` 后**必须重启或等缓存过期**才生效。
-  实测：改完 DB 立即查仍是旧值，重启后立即正确。
-
-### 7.2 作用二：拼接 SSO 回跳地址 —— 来自配置文件
-
-这些是**配置值**（不来自请求头），在 [application-maxkey.properties:34-44](../../maxkey-webs/maxkey-web-maxkey/src/main/resources/application-maxkey.properties#L34-L44)：
-
-```properties
-maxkey.server.basedomain   = ${SERVER_DOMAIN:maxkey.top}
-maxkey.server.domain       = sso.${maxkey.server.basedomain}     # ← 硬拼 sso. 前缀
-maxkey.server.name         = ${maxkey.server.scheme}://${maxkey.server.domain}
-maxkey.server.uri          = ${maxkey.server.name}:${server.port}${context-path}
-maxkey.server.frontend.uri = /maxkey
-```
-
-**注意 `sso.` 是写死的前缀**。若真实域名是 `sso.gov.cn`，要把
-`SERVER_DOMAIN` 设为 `gov.cn`（得到 `sso.gov.cn`）；
-若域名不含 `sso` 前缀（如 `cas.abc.com`），只设 `SERVER_DOMAIN` 得不到想要的结果，
-需要直接覆盖 `maxkey.server.domain`。
-
-未登录访问受保护端点时的跳转（实现在
-[SingleSignOnInterceptor.java:72](../../maxkey-webs/maxkey-web-maxkey/src/main/java/org/dromara/maxkey/web/interceptor/SingleSignOnInterceptor.java#L72)）：
-
-```
-302 → {frontend.uri}/#/passport/login?redirect_uri={base64(原始URL)}
-```
-
+域名对不上会**静默退回默认租户**，表现为"登录后看到别人的机构"。
 实测：
 
 ```
-302 Location: http://sso.kylin-test.local/maxkey/#/passport/login?redirect_uri=aHR0cDovL3Nzby5reWxpbi10ZXN0LmxvY2Fs...
-解码后:        http://sso.kylin-test.local/sign/authz/oauth/v20/authorize?client_id=x&response_type=code
+Host: sso.maxkey.top      → domain 返回 sso.maxkey.top（命中）
+Host: sso.lottery-dev.com → 仍返回 sso.maxkey.top（未命中，回落）
 ```
 
-`maxkey.server.frontend.uri` 在这里是**相对路径 `/maxkey`**，
-浏览器按当前站点拼接，所以换域名时这部分自动跟随。
-这是 Minimal-SSO 友好的设计——不需要为每个环境改这一段。
+所以上线后必须把「机构」的 domain 改成真实域名。
 
-### 7.3 作用三：JWT 的 `iss` 声明
+### 8.2 SSO 回跳地址拼接
 
-`maxkey.auth.jwt.issuer = ${maxkey.server.uri}`，
-即 `http://sso.<domain>:<port>/sign`。
+`SingleSignOnInterceptor` 未登录时跳：
 
-实测解出的 JWT payload：
-
-```json
-{ "iss": "http://sso.kylin-test.local:29527/sign", "sub": "admin", ... }
+```
+<maxkey.server.frontend.uri>/#/passport/login?redirect_uri=<base64(当前URL)>
 ```
 
-而校验只验签 + 校验过期（`validateJwtToken` 不校验 `iss`），
-所以**改域名不会导致已有 token 失效**，这点对升级平滑有利。
+`frontend.uri` 是相对路径（`/maxkey`），跟着当前 Host 走；
+但 OIDC/OAuth 的 issuer、`authorization_endpoint` 走的是
+`WebContext.getContextPath()`，依赖 §7.2 的请求推导。
+两者任一错位都会让回跳地址不可达。
 
-但要注意：`iss` 里带**内部端口 29527**（因为 `server.uri` 拼了 `server.port`）。
-如果要把 token 交给外部系统校验，这个 `iss` 是他们看到的“issuer 名字”，
-按需用 `LOGIN_JWT_ISSUER` 覆盖。
+### 8.3 Cookie 域
 
-### 7.4 三处作用汇总
-
-| 作用 | 取值来源 | 配错的表现 | 改后是否需重启 |
-|------|---------|-----------|--------------|
-| 租户识别 | 请求头 `Host` → 查 `mxk_institutions` | 静默回退默认机构，页面 Logo/标题不对 | **需要**（60 分钟缓存） |
-| SSO 回跳地址 | `maxkey.server.frontend.uri`（相对路径） | 跳转到错误站点 | 需要 |
-| JWT `iss` | `maxkey.server.uri` | 外部系统校验 issuer 失败 | 需要 |
+会话 Cookie 绑定当前域名。跨域名回跳会丢登录态。
 
 ---
 
-## 8. SSO 最小化：只保留什么
+## 9. 数据库：KingbaseES
 
-### 8.1 必须启动
+### 9.1 实测环境
+
+| 项目 | 值 |
+|------|-----|
+| 版本 | **KingbaseES V009R003C018**（`server_version` 报 12.1，PG 兼容） |
+| 端口 | 54321 |
+| 库/账号 | `maxkey` / `maxkey` |
+| 表数 | 44 张 `mxk_*` |
+
+### 9.2 建库脚本：为什么是 0.4MB 而不是 19MB
+
+`sql/kingbase/maxkey.sql` 是 44 表 / 3219 条 INSERT / 18.9MB 的演示数据全量版。
+
+**裁剪维度必须按字节，不能按行数** —— 这是本次最重要的一条实测结论：
+
+| 表 | 体积 | 行数 | 平均 |
+|----|------|------|------|
+| `mxk_userinfo` | 16693 KB | 60 | **278 KB/行**（每条内嵌 PNG 头像） |
+| `mxk_apps` | 1508 KB | 34 | **44 KB/行**（每个应用内嵌 PNG 图标） |
+| `mxk_history_login_apps` | 345 KB | **1219** | 0.3 KB/行 |
+| `mxk_permission` | 123 KB | 453 | 0.3 KB/行 |
+
+按行数裁掉 2290 条日志只能省 0.7MB（压缩比 96%，几乎没效果）；
+体积全在 60 个演示用户的头像和 34 个演示应用的图标里。
+
+`sql/kingbase/make-seed.py` 做字节感知裁剪：
+
+* 表结构**完全保留**（44 表、索引、约束、注释、序列一个不少）
+* `mxk_userinfo` 只留 admin
+* 图片类 bytea 置 `NULL`（`mxk_apps.icon` / `mxk_userinfo.picture`）
+* **保留** `mxk_apps_saml_v20_details` 的签名证书
+  （那是有效配置，不是图片，约 56KB）
+
+结果：**18.9MB → 0.4MB（2.1%）**。`--verify` 可自检结构与关键种子行。
+
+### 9.3 保留哪些表：依据是"登录链路会读它"
+
+不是"有数据就留"。踩过一个真实故障：最初把 `mxk_groups` /
+`mxk_group_member` 裁掉了，结果**能登录、门户却返回 0 个应用**，
+访问 authorize 被 `SingleSignOnInterceptor` 判为无权限，
+302 到 `/sign/authz/refused`。
+
+根因在 `AppsMapper.queryMyApps` 的 SQL：
+
+```sql
+select distinct app.* from mxk_apps app, mxk_access p, mxk_groups g
+where app.id = p.appid and p.groupid = g.id
+  and app.instid=? and p.instid=? and g.instid=?
+  and app.visible != 0
+  and g.id in (
+      select id from mxk_groups where groupcode = 'ROLE_ALL_USER'
+      union
+      select gm.groupid from mxk_group_member gm, mxk_userinfo u
+      where gm.memberid = u.id and u.username = ?)
+```
+
+没有 `ROLE_ALL_USER` 组 + admin 的成员记录 + `mxk_access` 授权行，
+应用列表就是空。故这三张表必须保留，且 `group_member` 只留 admin 的行
+（6 行，含关键的 `ROLE_ALL_USER_1`）。
+
+`mxk_apps_oauth_client_details` 也必须保留，否则授权时报
+`NoSuchClientException`。
+
+### 9.4 关键配置项
+
+`conf/maxkey.env`：
+
+```bash
+DATABASE_DRIVER=com.kingbase8.Driver
+DATABASE_URL='jdbc:kingbase8://127.0.0.1:54321/maxkey?characterEncoding=UTF-8&useUnicode=true'
+DATABASE_USER=maxkey
+# 口令不写入本文件，由 /etc/maxkey/maxkey-secret.env 注入
+DATABASE_DIALECT=kingbase
+DATABASE_COLUMN_ESCAPE=true
+DATABASE_COLUMN_ESCAPE_CHAR='"'
+```
+
+三个易错点（都已在 `maxkeyctl.sh` 里做启动前校验）：
+
+1. **JDBC URL 必须用单引号包**。裸写会让 bash 把 `&` 当后台分隔符，
+   `DATABASE_URL` 变空、后半截被当命令执行，最终应用**静默回落到
+   内置 MySQL 默认值**，症状是"配了 Kingbase 却连 3306"。
+2. **`DATABASE_PWD` 为空会拒绝启动**。Spring 7 的行为是：变量
+   **不存在**才回落默认值；变量存在但为**空串**时，`${DATABASE_PWD:maxkey}`
+   解析结果就是空串。所以空口令会直接连库失败而不是"悄悄用默认口令"。
+3. **KingbaseES 在 MySQL 兼容模式下 `online` 是保留字**，必须开
+   `DATABASE_COLUMN_ESCAPE=true` 且转义符用 `"`。
+
+---
+
+## 10. SSO 最小化：只保留什么
+
+### 10.1 必须启动
 
 | 组件 | 端口 | 作用 | 能否省 |
 |------|------|------|--------|
 | `maxkey` | 9527 | 认证中心：登录、发 token、OAuth/CAS/SAML/OIDC 端点 | **不能** |
 | `maxkey_mgt` | 9526 | 管理端：应用/用户/机构配置 | **不能**（否则无法配置应用接入） |
-| nginx | 80/443 | 静态前端 + 反代 | **不能**（前端是纯静态） |
+| nginx | 443 | 静态前端 + 反代 | **不能**（前端是纯静态） |
 | KingbaseES | 54321 | 数据库 | **不能** |
 
-### 8.2 可以不启动
+### 10.2 不启动
 
 | 组件 | 端口 | 说明 |
 |------|------|------|
-| `maxkey-web-openapi` | 9525 | SCIM/开放 API，SSO 核心流程不依赖 |
-| `maxkey-gataway` | 9000 | Spring Cloud Gateway，单机不需要 |
+| `maxkey-web-openapi` | 9525 | 只有 1 个 OTP 校验 controller，SSO 核心链路不依赖。已从构建中移除（源码保留） |
+| `maxkey-gataway` | 9000 | **已删除**。没有 Spring Boot 插件、依赖全注释，构建不出可运行构件 |
 | Redis | 6379 | 默认 `SERVER_PERSISTENCE=0` 即内存会话，单实例够用 |
-| RocketMQ / Nacos | - | 非 SSO 必需 |
+| Nacos / RocketMQ | - | 非 SSO 必需 |
 
-> 注意 Redis 的取舍：`maxkey.server.persistence` 默认 `0`（内存）。
-> 会话存在 JVM 内存里，**重启会丢登录态**，且不支持多实例。
-> 若将来要横向扩展再切 `2`（Redis），当前最小化不需要。
+> Redis 的取舍：`maxkey.server.persistence` 默认 `0`（内存 Caffeine）。
+> 会话在 JVM 内存里，**重启会丢登录态**，且不支持多实例。
+> 要横向扩展再切 `2`（Redis），当前最小化不需要。
 
-### 8.3 建议关闭的功能（减少依赖面）
-
-在 `conf/maxkey.env`：
+### 10.3 建议关闭的功能
 
 ```bash
+LOGIN_CAPTCHA=false        # 内网首次联调可关；生产建议 true
 LOGIN_MFA_ENABLED=false    # 无短信/邮箱通道时关掉 TOTP
-LOGIN_CAPTCHA=true         # 生产建议开；内网联调可关
 ```
 
-Passkey 相关的 `maxkey.login.passkey.*` 默认 `localhost`，
-公网域名下如需 Passkey 要改 riding-party id 与 allowed-origins，否则浏览器会拒绝。
-
-### 8.4 单点登录闭环的最短路径
+### 10.4 单点登录闭环的最短路径
 
 1. 启动 `maxkey` + `maxkey_mgt` + nginx
-2. 登录管理端 → 配置「机构」域名（与 nginx `server_name` 一致）
-3. 配置「应用」→ 选协议（OAuth2/CAS/OIDC/SAML）→ 填回调地址
+2. 登录管理端 → 配置「机构」domain（与 nginx `server_name` 一致）
+3. 配置「应用」→ 选协议（OAuth2/OIDC/CAS/SAML）→ 填回调地址
 4. 业务系统按所选协议接入
 5. 用户访问业务系统 → 未登录 → 302 到 `/maxkey/#/passport/login` → 登录 → 回跳
 
-第 3 步的回调地址必须与后端 `applicationConfig` 生成的 issuer 对得上，
+第 3 步的回调地址必须与后端生成的 issuer 对得上，
 否则 OAuth 会报 `redirect_uri mismatch`。这是最常见的接入故障。
 
----
-
-## 9. 麒麟部署 checklist
-
-```bash
-# 1. 解包并统一到 /opt/maxkey
-tar xzf maxkey-kylin-4.2.0.tar.gz -C /opt
-mv /opt/maxkey-kylin-4.2.0 /opt/maxkey
-cd /opt/maxkey
-
-# 2. 环境自检（强烈建议先跑，一次暴露所有阻塞项）
-./bin/preflight.sh
-#   检查项：系统/架构、glibc 基线、JDK 版本、AWT 字体、
-#           配置语法与关键字段、端口占用、Kingbase 连通与建表、
-#           nginx/SELinux/firewalld、目录权限
-#   输出 24 项通过 / 1 警告 / 1 阻塞 这类汇总，有阻塞则退出码 1
-
-# 3. 确认 JDK（二选一）
-./bin/maxkeyctl.sh java         # 若显示 major=21 即可用
-./bin/make-runtime.sh           # 或现场生成内置运行时
-
-# 4. 建库
-ksql -U system -d maxkey -f sql/maxkey.sql
-
-# 5. 改配置（域名、数据库地址等；**口令不写在这里**）
-vi conf/maxkey.env
-
-# 5.1 注入数据库口令（必需，否则启动会被显式拦下）
-#     口令不写入 conf/maxkey.env —— 那是被 git 跟踪的模板，
-#     填明文会直接进提交历史。改用仓库外的独立密钥文件。
-sudo mkdir -p /etc/maxkey
-sudo cp conf/maxkey-secret.env.example /etc/maxkey/maxkey-secret.env
-sudo vi /etc/maxkey/maxkey-secret.env        # 填入真实口令
-sudo chown root:root /etc/maxkey/maxkey-secret.env
-sudo chmod 600 /etc/maxkey/maxkey-secret.env
-
-#     手工启动（不走 systemd）则直接导出环境变量即可：
-#     export DATABASE_PWD='实际口令' && ./bin/maxkeyctl.sh start
-
-# 6. 部署前端与 nginx（选方案 A 或 B）
-mkdir -p /opt/maxkey/web
-cp -a web/maxkey web/maxkey-mgt /opt/maxkey/web/
-# 方案A:
-cp nginx/maxkey-standalone.conf /etc/nginx/conf.d/maxkey.conf
-cp nginx/maxkey-proxy.conf      /etc/nginx/maxkey-proxy.conf
-# 方案B: 把 nginx/maxkey-into-existing.conf include 进现有 server{}
-nginx -t && nginx -s reload
-
-# 7. 启动
-./bin/maxkeyctl.sh start
-./bin/maxkeyctl.sh status
-
-# 8. 验证
-curl -s -H "Host: <你的域名>" http://127.0.0.1/sign/inst/get
-# 期望：返回机构的 domain 与你配置的域名一致（不一致说明缓存或配置问题）
-```
-
----
-
-## 10. 排障速查
-
-| 现象 | 根因 | 处理 |
-|------|------|------|
-| `UnsupportedClassVersionError` | JDK < 21 | `./bin/maxkeyctl.sh java` 查看；改用内置 jre |
-| `GLIBC_2.3x not found` | 用系统自带 JDK 构建，基线过高 | 改用 Temurin：`./bin/make-runtime.sh --download`（基线 2.15）；详见 §3.4 |
-| 配了 Kingbase 却连 3306 | JDBC URL 中 `&` 被 shell 截断 | URL 加单引号（脚本已做校验） |
-| `online` 列名报错 | 未开启标识符转义 | `DATABASE_COLUMN_ESCAPE=true` + 转义符 `"` |
-| **能登录但返回 code=2，日志 `bad SQL grammar ... online = 1`** | 手写 SQL 绕过标识符转义（见 §11.2） | 需代码修复；仅配 `DATABASE_COLUMN_ESCAPE` 无效 |
-| 分页 SQL 报错 | 方言未生效 | `DATABASE_DIALECT=kingbase` |
-| 页面能开但 API 全 404 | `proxy_pass` 漏尾部路径 | `proxy_pass .../sign/;` |
-| JS 报 `Unexpected token '<'` | 静态资源被回退成 index.html | 加 `try_files $uri =404` |
-| 改了机构域名不生效 | 60 分钟 Caffeine 缓存 | 重启 `maxkey` |
-| 登录后跳到 `127.0.0.1` | 缺 `Host` / `X-Forwarded-*` 头 | 引 `maxkey-proxy.conf` |
-| 日志文件涨到 GB | 未轮转 | 脚本已加 50MB 轮转；生产可用 logrotate |
+> 注意：每个 OAuth client 在 `mxk_apps_oauth_client_details` 里有独立的
+> `issuer` / `audience` 字段，**默认值是演示域名**
+> （如 `https://sso.maxkey.top/maxkey`）。上线时必须改成真实域名，
+> 否则它签出的 `id_token` 里 `iss` 是旧域名，客户端校验会失败。
 
 ---
 
 ## 11. 实测验证记录
 
-### 11.1 真实 KingbaseES 环境验证（2026-10-28）
+> 环境：Ubuntu 24.04.5 x86_64，glibc 2.39，nginx 1.24.0，
+> KingbaseES V009R003C018，JDK 21（jlink 产物 59MB）。
+> 所有验证均在本机完成。因 `sudo` 受限（`no new privileges`），
+> systemd 与 `/opt` 部分用隔离前缀 + 非 root nginx 实例等效验证，
+> 相关项在表中标注。
 
-**环境**：KingbaseES `V009R003C018`（= V9R3C18），`database_mode=mysql`，`UTF8`，
-`maxkey` 库 44 表 / 60 用户 / 34 应用，账号 `maxkey`。
-应用运行在 `jlink` 裁剪运行时（64MB，Temurin 构建）上，`DATABASE_DIALECT=kingbase` +
-`DATABASE_COLUMN_ESCAPE=true` + 转义符 `"`。
+### 11.1 构建链路
 
-| 验证项 | 方法 | 结果 |
-|--------|------|------|
-| 真实 Kingbase 连接 | `kingbase8` 驱动 → 54321 | ✅ `connected: KingbaseES 12.1` |
-| 应用连接真实 Kingbase | 启动日志中的 JDBC URL | ✅ `jdbc:kingbase8://127.0.0.1:54321/maxkey` |
-| 应用启动 | `maxkeyctl.sh start portal` | ✅ 6–8s，无 SQL 错误 |
-| 读取数据 | `GET /sign/inst/get` | ✅ 返回真实机构数据 |
-| **admin 登录** | `POST /sign/login/signin` | ✅ `code=0`，8 个权限 |
-| **登录状态回写** | 查 `mxk_userinfo` | ✅ `logincount` 1841→1842，`online=1` |
-| JWT 签发 | 解析 token | ✅ `iss=http://sso.kylin-test.local:29527/sign` |
-| SSO 回跳 | 未登录访问 authz 端点 | ✅ 302 → `/maxkey/#/passport/login?redirect_uri=...` |
-| 租户按 Host 解析 | 变更 `Host` 头 | ✅ 命中 `domain` / `consoledomain` |
-| 机构 60 分钟缓存 | 改库后立即查 vs 重启后查 | ✅ 立即查仍旧值，重启后生效 |
-| `online` 保留字 | `select id,online from ...` | ✅ 裸写报 `syntax error at or near "online"`；`"online"` 正常 |
-| 分页方言 | 对比 `getPreparedStatementLimitString` | ✅ MySQL `limit ? , ?`；kingbase `limit ? offset ?` |
-| 分页 SQL 可执行 | JDBC 参数化执行两种写法 | ✅ `LIMIT ? OFFSET ?` rows=10 |
-| 关键字方言表 | 反射查 `DialectMapper` | ✅ 内置无 kingbase，注册后映射到 `KingbaseDialect`（父类 `PostgreSQLDialect`） |
+| 项目 | 结果 |
+|------|------|
+| `gradle projects` | 工程列表不再含 `gataway`；openapi 已排除 |
+| `bootJar` ×2 | 成功（离线 11 秒），portal 205MB / mgt 196MB |
+| `pnpm install --frozen-lockfile` | 成功（1 分 0 秒），此前因缺 lockfile **必然失败** |
+| 前端构建 ×2 | portal 5.9s（初始包 2.51MB / gzip 489KB），mgt 9.9s |
+| 打包 | `maxkey-deploy-4.2.0.tar.gz` 361MB，结构完整 |
 
-**本节最重要的发现**：这一轮真实 Kingbase 验证暴露了一个此前 MySQL 环境下
-**不可能发现**的生产级缺陷，见 §11.2。
+### 11.2 运行时
 
-### 11.2 真实 Kingbase 暴露并已修复的缺陷：硬编码 SQL 绕过标识符转义
+| 项目 | 结果 |
+|------|------|
+| jlink 23 模块 | **59MB**，4 秒生成 |
+| 缺 `java.desktop` 时 | 自检正确拦截，输出 `NoClassDefFoundError: java/awt/image/BufferedImage` 并判定"缺 java.desktop" |
+| 补齐后 | 自检通过 |
+| portal 启动 | **8 秒**成功（用包内 jre） |
+| mgt 启动 | **8 秒**成功（用包内 jre） |
+| 验证码渲染 | HTTP 200，图片正常（证明 `java.desktop` 真实生效） |
 
-**现象**：登录接口返回 `code=2`，但日志显示认证本身已成功
-（`'admin' authenticated successfully`），JWT 也已签发。
+### 11.3 nginx 路由
 
-**根因**：
+经 TLS 反代实测（隔离实例，非标准端口；等效于 443 的线上形态）：
 
-```
-PreparedStatementCallback; bad SQL grammar
-[update mxk_userinfo set badpasswordcount = 0 , logincount = logincount + 1 ,
- lastlogintime = ?  , lastloginip = ? , online = 1  where id = ?]
-```
+| 请求 | 结果 |
+|------|------|
+| `/maxkey/` | 200 |
+| `/maxkey/passport/login`（深链接） | 200（SPA 回退生效） |
+| `/maxkey/assets/<存在的>.js` | 200 |
+| `/maxkey/assets/nope.js` | **404**（未误回退 index.html） |
+| `/maxkey-mgt/` | 200 |
+| `/maxkey-mgt-api/inst/get` | 200（透传到 9526） |
+| `/sign/inst/get` | 200（透传到 9527） |
+| `/healthz` | 200 |
 
-`LoginServiceImpl` 里这条 SQL 是**手写字符串常量**，走 `jdbcTemplate`，
-不经过 MyBatis 的 mapper XML。而 `mybatis.table-column-escape` 只对
-XML 生成的 SQL 生效，**对手写 SQL 完全无效**。
+### 11.4 对外地址与 SSO
 
-KingbaseES 在 MySQL 兼容模式下 `online` 是保留字（`catcode=R`，已实测确认），
-裸写必然报错。后果不只是"登录失败"：
+| 项目 | 结果 |
+|------|------|
+| 未开 `forward-headers-strategy` | `authorization_endpoint: http://127.0.0.1:9527/sign/authz/oauth/v20/authorize`（错） |
+| 开启后（带 X-Forwarded） | `https://sso.lottery-dev.com:9443/sign/authz/oauth/v20/authorize`（对） |
+| OIDC issuer | `https://sso.lottery-dev.com:9443/sign/maxkey` |
+| JWT 解码 | `iss = https://sso.lottery-dev.com:9443/sign`（无内部端口，与元数据一致） |
+| 租户识别 | `Host: sso.maxkey.top` 命中；不匹配的 Host 回落默认租户 |
 
-- 用户已通过密码校验，但接口最终返回失败
-- `logincount`、`online`、`lastlogintime`、`lastloginip` 全部没写进去
-- 表现为"能登录但登录统计/在线状态永远不更新"
-
-**修复**（[LoginServiceImpl.java:416](../../maxkey-persistence/src/main/java/org/dromara/maxkey/persistence/service/impl/LoginServiceImpl.java#L416)）：
-新增 `buildLoginUserinfoUpdateStatement()`，按与 mybatis **同一套**
-`table-column-escape` / `-escape-char` 配置动态拼接列名。
-
-**兼容性证明**：未开启转义时（MySQL 默认部署）生成的 SQL 与历史硬编码版本
-**逐字节一致**，零回归：
+**浏览器端到端（Playwright + Chromium，真实 TLS 经 nginx）**：
 
 ```
-默认(MySQL) 生成的SQL: ... , online = 1  where id = ?
-历史硬编码SQL        : ... , online = 1  where id = ?
-是否逐字节一致? true
+✓ 登录页可访问  HTTP 200
+✓ 登录页表单已渲染
+✓ 页面标题已加载  "Login - MaxKey"
+✓ 登录接口返回 code=0  HTTP 200 code=0
+✓ 拿到认证 token
+✓ JWT iss 为公网地址（非内部端口）  iss=https://sso.lottery-dev.com:9443/sign
+✓ 门户返回授权应用列表  HTTP 200 应用数=14
+✓ 已到达授权环节
+✓ 取得 oauth_approval 令牌
+✓ 审批请求已提交  HTTP 200
+✓ 审批返回带授权码的回跳 URL  .../callback?code=<uuid>
+✓ 提取授权码 code
+✓ 授权码换取 access_token 成功（含 id_token）
 ```
 
-**修复后实测**：`logincount` 1841 → 1842，`"online"=1`，登录时间正确写入 Kingbase。
+即 **登录 → 授权 → 发码 → 换令牌** 整条链路闭合。
 
-> 这条缺陷说明"用 PostgreSQL 代替验证"是不够的：PostgreSQL 建表时
-> `online` 不是保留字，所以同名 SQL 在 PG 上能通过，问题被掩盖。
-> **必须用真实 KingbaseES 验证**。
+未登录访问 OAuth 端点时的行为也验证过：
 
-### 11.3 通用验证（MySQL / nginx / 运行时）
+```
+GET /sign/authz/oauth/v20/authorize?...
+→ 302 https://sso.lottery-dev.com:9443/maxkey/#/passport/login?redirect_uri=<base64>
+```
 
-| 验证项 | 方法 | 结果 |
-|--------|------|------|
-| 裁剪运行时能启动 | `jre/bin/java -jar maxkey-boot.jar` | ✅ 6–8s 启动 |
-| 缺 `java.desktop` 会失败 | 去掉该模块重建运行时 | ❌ `NoClassDefFoundError: java/beans/PropertyChangeEvent`（证明必须保留） |
-| headless 渲染验证码 | 请求 `/sign/captcha` | ✅ 输出 120×40 PNG，3508 字节 |
-| nginx 独立站点 | 方案 A 配置实测 | ✅ index/深链接/assets 200，缺失资源 404 |
-| nginx 合并进已有站点 | 现有站点 + MaxKey 片段共存 | ✅ 双方均正常，互不影响 |
-| `alias` + `try_files` | 按该写法部署 | ❌ 深链接/assets 404（故改用 `root`） |
-| 配置错误的静默失败 | 裸 `&` 的 JDBC URL | ❌ `DATABASE_URL` 变空串并回落 MySQL（已加启动前校验） |
-| 从任意目录启动 | `cd /` 后执行脚本 | ✅ 日志正确落在应用目录 |
-| 无 `JAVA_HOME` 启动 | `env -u JAVA_HOME` | ✅ 自动使用包内 `jre/` |
+回跳地址正确携带原始授权 URL（base64），符合 SSO 预期。
 
-### 11.4 glibc 问题已解决（原为"唯一硬阻塞"，现已消除）
+### 11.5 数据库
 
-**原判断**：jre 在 Ubuntu 24.04 构建，需 `GLIBC_2.38`，麒麟 V10 是 2.28，
-因此"必须在麒麟上构建"。
+| 项目 | 结果 |
+|------|------|
+| `maxkey-seed.sql` 导入 | **3.2 秒，0 错误** |
+| 表结构 | 44 张 `mxk_*`，与源文件完全一致 |
+| 数据 | 1 个用户（admin）、1 个机构、14 个组、admin 6 条成员关系、24 条授权、34 个应用、14 个 OAuth client |
+| 协议覆盖 | CAS 9 / SAML 7 / OAuth2 7 / OAuth2.1 1 / OIDC 1 / JWT 2 / Token 3 / ExtendAPI 3 / Basic 1 |
+| 登录 | `admin/{plain}maxkey` 成功，`Authorized Apps` 返回 15 个应用 |
+| 登录历史写入 | 正常落库（`mxk_history_login`） |
 
-**修正后的结论**：该判断**过窄**。glibc 向后兼容，真正决定基线的是
-**用哪个 JDK 发行版构建**，而非构建机器的操作系统。
+### 11.6 安装脚本
 
-实测证据（同一台 Ubuntu 24.04、同一条 jlink 命令）：
+| 项目 | 结果 |
+|------|------|
+| `install.sh --dry-run`（非 root） | 通过，仅打印操作 |
+| 域名冲突检测 | **正确命中**本机已有的 `sso-sso.lottery-dev.com.conf` 并中止，未改动任何 nginx 文件 |
+| 渲染校验 | 端口（IPv4+IPv6）、证书路径、server_name 均正确替换，无占位符残留 |
+| `uninstall.sh` | 语法通过；默认保留配置与数据，`--purge` 才删目录 |
 
-| 构建用 JDK | `libjvm.so` 需要 glibc | 麒麟 V10 (2.28) 可用 |
-|-----------|----------------------|---------------------|
-| Ubuntu 自带 `openjdk-21-jdk` | `GLIBC_2.38` | ❌ |
-| **Adoptium Temurin 21** | **`GLIBC_2.15`** | ✅ |
-| 系统 `openjdk-17`（同为 Ubuntu 包） | `GLIBC_2.38` | ❌ |
+### 11.7 仍需在目标环境确认的项
 
-**已固化为工具约束**：`make-runtime.sh` 现在会读取 `libjvm.so` 的
-`GLIBC_*` 符号版本，与 `TARGET_GLIBC`（默认 2.28）比较，不合格直接拒绝出包，
-并给出 Temurin 下载命令。同时新增 `--download` 一键获取 Temurin。
+以下因本机环境限制未能真实验证，首次部署时请重点确认：
 
-**已端到端验证**：用 `--download` 生成的 64MB 运行时启动应用，
-在真实 KingbaseES 上 `admin` 登录 `code=0`、零 SQL 错误、SSO 回跳正常。
+| 项目 | 原因 | 如何确认 |
+|------|------|---------|
+| systemd 单元启停 | 本机 `sudo` 受限 | `systemctl start maxkey-portal && systemctl status maxkey-portal` |
+| `User=maxkey` 权限 | 无法创建系统用户 | 启动后 `ps -o user= -p <pid>` 应为 maxkey |
+| SELinux / firewalld | 本机未启用 | `sestatus`、`firewall-cmd --list-ports`；nginx 需能读 `/opt/maxkey/web` |
+| AWT 字体 | 本机字体齐全 | `preflight.sh` 会检测；缺则 `yum install fontconfig dejavu-sans-fonts` |
+| 麒麟 V10 上的实际运行 | 本机是 Ubuntu | 用 `--with-runtime` 出的包，其 glibc 基线 2.15 < 2.28，理论上可直接跑 |
+| 真实证书（非自签） | 私钥无读权限 | 用现场证书替换后 `nginx -t` |
 
-**缓存机制实测（同一台机器）**：
+---
 
-| 场景 | 耗时 | 联网 |
+## 12. 已知问题（本期不修，但必须知道）
+
+以下是排查过程中发现的既有缺陷。都不在本次四个目标范围内，
+故**只记录不修**，避免扩大改动面。
+
+### 12.1 JWT HMAC 密钥明文硬编码（安全）
+
+`maxkey.auth.jwt.secret` 与 `refresh.secret` 是 512 字符的字面量，
+明文写在 `application-maxkey.properties`、`application-maxkey-mgt.properties`
+（两处**完全相同**）。打包后任何人 `unzip` jar 即可取得。
+
+影响：拿到 jar 就能伪造任意用户的 JWT。
+
+缓解：至少做到 jar 不外发；如需彻底解决，改为
+`${JWT_SECRET}` 环境变量注入 + 部署时生成随机值。
+注意一改就必须同步改 mgt，否则两边校验互不通。
+
+### 12.2 Redis 配置用旧命名空间（潜在启动失败）
+
+`RedisAutoConfiguration` 读的是 `${spring.redis.host}` /
+`${spring.redis.password}`，且**没有默认值**。Spring Boot 4 已迁移到
+`spring.data.redis.*`。
+
+当前 `maxkey.server.persistence=0` 走内存分支，不会触发；
+但 `RedisAutoConfiguration` 是无条件 `@AutoConfiguration`，
+一旦启用 Redis（`SERVER_PERSISTENCE=2`）就会因属性解析失败而启动失败。
+
+另：`RedisDefaultConfig` 默认口令是 `admin`，而 properties 默认
+`REDIS_PWD:password`，两者本身也不一致。
+
+### 12.3 SAML keystore 口令硬编码
+
+`config/*.jks` 与 `*.jwks` 打包进 jar，口令 `maxkey` 写在 properties 里。
+多实例部署时所有实例共用同一套签名密钥。
+
+### 12.4 确认页面注入第三方统计脚本（隐私/合规）
+
+`templates/add-html-head-content.vm` 里有一段经过 `\x` 转义混淆的脚本，
+解码后是：
+
+```
+https://hm.baidu.com/hm.js?ae02bfc0d49b4dfa890f81d96472fe99
+```
+
+内容是百度统计的站点访问跟踪。它会出现在 SSO 授权确认页上，
+意味着**内网用户的授权页会向外部发起请求**，在信创/等保场景通常不可接受。
+
+来源已追溯：该文件自 2021-07-31 的提交 `469437929`（"static"）起就在上游
+仓库，不是本次引入。
+
+缓解：部署前清空该模板内容（保留文件，避免模板缺失报错）：
+
+```bash
+# 源文件（重新打包前）
+: > maxkey-webs/maxkey-web-maxkey/src/main/resources/templates/add-html-head-content.vm
+```
+
+若要彻底解决，应改为可配置项并在默认配置里关闭。
+
+### 12.5 `mxk_apps_oauth_client_details.issuer` 默认是演示域名
+
+每个 OAuth client 有独立的 `issuer` / `audience` 字段，
+默认值形如 `https://sso.maxkey.top/maxkey`、`http://sso.maxkey.top:9527/...`。
+
+实测 `id_token` 里的 `iss` 就是取这个字段，因此**不会**跟随
+`MAXKEY_PUBLIC_URL` 变化。上线时必须逐个改成真实域名，
+否则客户端按真实 issuer 校验会失败。
+
+### 12.6 OAuth2 password grant 抛 NPE（上游缺陷）
+
+`POST /sign/authz/oauth/v20/token` 用 `grant_type=password` 时抛：
+
+```
+java.lang.NullPointerException: Cannot invoke "java.util.Collection.size()" because "c" is null
+  at java.util.LinkedHashSet.<init>
+  at AbstractUserDetailsAuthenticationProvider.createSuccessAuthentication
+```
+
+根因：`SignPrincipal` 的 `grantedAuthority` 字段从未被赋值，
+`getAuthorities()` 返回 `null`，Spring Security 在
+`new LinkedHashSet<>(null)` 处崩。
+
+`authorization_code` 流程不受影响（本次 SSO 验证走的就是它）。
+修复方式是让 `getAuthorities()` 返回空集合而非 null，但属于上游代码改动，
+本期不动。
+
+### 12.7 会话不支持多实例
+
+`SERVER_PERSISTENCE=0`（默认）时会话在 JVM 内存（Caffeine），
+重启丢登录态，且无法水平扩展。需要多实例时切 Redis
+（但要先修 12.2）。
+
+### 12.8 包体积偏大
+
+两个 fat jar 各约 200MB（合计 361MB 压缩包），主要来自依赖较多。
+可用 layered jar 或裁剪不需要的协议模块来减小，
+但会影响灵活性，本期未做。
+
+---
+
+## 13. 排障速查
+
+| 现象 | 根因 | 处理 |
 |------|------|------|
-| 首次（无缓存） | 1 分 31 秒 | 是 |
-| 二次（命中解压目录） | **4.2 秒** | 否 |
-| 二次（仅命中压缩包） | 6.0 秒 | 否 |
-| 全新包目录 + `TEMURIN_CACHE` 共享 | **4.2 秒** | 否 |
-| 缓存包被篡改（写入垃圾字节） | 自动丢弃并重下，日志打印期望/实际 sha256 | 是 |
-| `--clean-cache` | 删除 545MB，幂等 | — |
+| `UnsupportedClassVersionError` | 目标机 JDK < 21 被优先选中 | `./bin/maxkeyctl.sh java` 查看实际使用的 java；确认 `jre/` 存在 |
+| `GLIBC_2.3x not found` | 用系统自带 JDK 构建，基线过高 | 改用 Temurin：`./bin/make-runtime.sh --download` |
+| `NoClassDefFoundError: java/beans/...` | 裁剪运行时缺 `java.desktop` | `./bin/maxkeyctl.sh start` 会直接指出；补齐模块重新生成 |
+| **登录成功但立刻被踢回登录页** | JWT 的 iss 与实际 origin 不一致 | 检查 `MAXKEY_PUBLIC_URL` 是否等于浏览器实际地址（含端口） |
+| OIDC 元数据里出现 `127.0.0.1:9527` | 未开 `forward-headers-strategy` 或 nginx 没传 `X-Forwarded-*` | 两者都要有 |
+| SSO 回跳到错误的域名/端口 | `MAXKEY_PUBLIC_URL` 与 nginx `server_name`/端口不一致 | `install.sh` 会拦；手工核对 §7.3 |
+| **能登录但门户应用列表为空** | 缺 `ROLE_ALL_USER` 组或其成员记录 | 见 §9.3，检查 `mxk_groups` / `mxk_group_member` / `mxk_access` |
+| 访问 authorize 被 302 到 `/authz/refused` | 该应用未对当前用户组授权，或 `visible=0` | 管理端给对应组授权，或调整 `mxk_apps.visible` |
+| 配了 Kingbase 却连 3306 | JDBC URL 中 `&` 未加引号被 shell 截断 | URL 加单引号（脚本已做校验） |
+| `online` 列名报错 | 未开启标识符转义 | `DATABASE_COLUMN_ESCAPE=true` + 转义符 `"` |
+| 分页 SQL 报错 | 方言未生效 | `DATABASE_DIALECT=kingbase` |
+| 页面能开但 API 全 404 | `proxy_pass` 漏尾部路径 | `proxy_pass .../sign/;` |
+| 改了 nginx 配置不生效 | 存在同 `server_name` 的另一个站点 | `nginx -t` 会报 `conflicting server name`；`install.sh` 会提前拦 |
+| `.js` 报 `Unexpected token '<'` | 静态资源缺失回退到了 index.html | 静态资源 location 用 `try_files $uri =404` |
+| 改 DB 配置后不生效 | client 信息有 Caffeine 缓存 | 重启进程 |
+| 启动被拒绝，提示 DATABASE_PWD 为空 | 口令未注入 | 填 `/etc/maxkey/maxkey-secret.env` |
+| `Invalid redirect: ... does not match` | 回调地址与 client 注册值不一致 | 管理端改该应用的回调地址（精确匹配，含路径） |
 
-固定版本 `21.0.13+9`，x64 sha256 已实测与 Adoptium API 返回值一致
-（`d7f5d5cf...d66d1c`），脚本内置该校验值。
+---
 
-**因此交付路径简化为**：
+## 14. 日常运维
 
+```bash
+# 启停
+./bin/maxkeyctl.sh start|stop|restart|status [portal|mgt|all]
+./bin/maxkeyctl.sh java              # 查看实际使用的 JDK 与版本
+
+# systemd
+systemctl start|stop|restart maxkey-portal maxkey-mgt
+journalctl -u maxkey-portal -f
+
+# 日志（log4j2 用相对路径，日志在各应用目录下）
+tail -f /opt/maxkey/maxkey/logs/maxkey.log
+tail -f /opt/maxkey/maxkey_mgt/logs/maxkey.log
+tail -f /opt/maxkey/logs/nohup-portal.out
+
+# 升级（保留配置与日志）
+tar xzf maxkey-deploy-<新版本>.tar.gz && cd maxkey-deploy-<新版本>
+sudo ./install.sh          # conf/ 与 logs/ 不会被覆盖
+sudo ./bin/maxkeyctl.sh restart
+
+# 卸载
+sudo ./uninstall.sh          # 保留 /opt/maxkey、/etc/maxkey、数据库
+sudo ./uninstall.sh --purge  # 连程序目录一起删；数据库仍不删
 ```
-任意一台可联网 Linux（x86_64）
-   └─ ./make-runtime.sh --download     ← 自动取 Temurin（基线 2.15）
-        └─ 产物 jre/ + 整个部署包      ← 可直接拷到生产麒麟
-```
-
-不再需要"测试麒麟出包、生产麒麟运行"，也不需要两台麒麟。
-
-### 11.5 仍需在目标环境确认的项
-
-- **CPU 架构**：本次为 `x86_64`。若生产是飞腾/鲲鹏（`aarch64`）或龙芯，
-  须在对应架构机器上重跑 `make-runtime.sh --download`（脚本会自动识别 `uname -m`）。
-  **这是唯一仍与运行环境绑定的因素。**
-- **管理端（9526）**：`maxkey-mgt-boot` 因构建环境 Gradle native 库
-  （`libnative-platform.so`）无法加载而未能重新打包，其启动与 `/users/query`
-  分页未在本轮实测；逻辑与认证中心同源（同一套 dialect 与转义配置），
-  风险低但建议正式构建后复验。
-- **glibc 实际版本**：麒麟 V10 各 SP 版本基线略有差异，部署前用
-  `./bin/preflight.sh` 确认，必要时用 `TARGET_GLIBC=` 调整。

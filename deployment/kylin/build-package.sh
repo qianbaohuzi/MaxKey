@@ -4,7 +4,7 @@
 #
 #  产物结构（与 make-runtime.sh、maxkeyctl.sh 的假设一致）:
 #
-#     maxkey-kylin-<version>/
+#     maxkey-deploy-<version>/
 #     ├── maxkey/                 maxkey-boot-*.jar  + logs/
 #     ├── maxkey_mgt/             maxkey-mgt-boot-*.jar + logs/
 #     ├── web/
