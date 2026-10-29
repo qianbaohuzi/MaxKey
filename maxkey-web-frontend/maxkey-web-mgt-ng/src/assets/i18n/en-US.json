@@ -60,7 +60,7 @@
 			"audit": {
 				"": "Audits",
 				"logins": "Logins",
-				"loginapps": "LoginApps",
+				"loginapps": "Management Audit Log",
 				"synchronizer": "Synchronizer",
 				"connector": "Connector",
 				"operate": "Management"

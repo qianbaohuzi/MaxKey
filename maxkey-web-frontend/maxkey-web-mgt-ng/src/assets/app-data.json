@@ -196,7 +196,7 @@
               "children": []
             },
             {
-              "text": "访问日志",
+              "text": "管理端审计日志",
               "i18n": "mxk.menu.audit.loginapps",
               "link": "/audit/audit-login-apps",
               "icon": "anticon-audit",
