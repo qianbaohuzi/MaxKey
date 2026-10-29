@@ -75,6 +75,13 @@ include ('maxkey-webs:maxkey-web-maxkey')
 //management(mgt)
 include ('maxkey-webs:maxkey-web-mgt')
 //openapi(open)
-include ('maxkey-webs:maxkey-web-openapi')
+//本期只交付 portal + mgt 的最小化 SSO 拓扑，openapi 不参与构建（源码保留备用）。
+//openapi 只有一个 OTP 校验 controller，SSO 核心链路不依赖；从构建中移除可少打
+//一个 200MB 级 fat jar、少一个 9525 常驻端口。
+//若后续需要开放 API / SCIM，取消下面一行注释即可恢复构建。
+//include ('maxkey-webs:maxkey-web-openapi')
 //gataway
-include ('maxkey-webs:maxkey-gataway')
+//maxkey-gataway 已删除：它没有应用 Spring Boot 插件，spring-cloud 依赖全部被注释，
+//构建不出可运行构件，是一个死桩。单机部署不需要 Spring Cloud Gateway。
+//注意：本行必须保持注释状态。模块源码与 build.gradle 已移除，
+//若重新 include 会得到一个空项目，误以为"支持网关模式"。

@@ -80,3 +80,4 @@ maxkey-secret.env
 # 例外：部署脚本（**/bin 是 Eclipse 产物目录规则，不适用于本目录）
 !deployment/kylin/bin/
 !deployment/kylin/bin/**
+__pycache__/
