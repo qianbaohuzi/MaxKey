@@ -105,6 +105,31 @@ EMPTY_TABLES = {
     "mxk_apps_form_based_details",
     "mxk_apps_oauth_client_details",
     "mxk_access",                        # 应用授权行（应用没了就是孤儿）
+
+    # --- 会话 / 登录态 ---
+    # 这些是运行时产生的状态，交付一个干净实例时不应带任何历史。
+    # 注意 mxk_remember_me：官方 dump 里有 2 条 2022 年的演示记录，
+    # 其 expirationtime 早已过期，但留着会让"记住我"列表出现陌生条目。
+    "mxk_remember_me",                   # 记住我令牌
+    "mxk_passkey_challenges",            # WebAuthn 挑战（一次性，本就不该持久化）
+    "mxk_user_passkeys",                 # 用户已注册的通行密钥
+    "mxk_history_login",                 # 登录历史
+    "mxk_history_login_apps",            # 登录历史-应用明细
+    "mxk_history_system_logs",           # 系统操作日志
+    "mxk_history_event",                 # 事件日志
+
+    # --- 连接器与同步（运行时配置 + 历史）---
+    "mxk_connectors",                    # 连接器实例
+    "mxk_history_connector",             # 连接器执行历史
+    "mxk_history_provisions",            # 账号供给历史
+    "mxk_history_synchronizer",          # 同步器执行历史
+    "mxk_synchronizers",                 # 同步器配置
+    "mxk_synchro_association",           # 同步对象关联
+    "mxk_synchro_related",               # 同步关联明细
+
+    # --- 临时数据 ---
+    "mxk_file_upload",                   # 上传暂存
+    "mxk_register",                      # 自助注册待审
 }
 
 # 只保留指定行（表 -> 判定函数）
@@ -257,11 +282,23 @@ def main():
             print("种子 %-26s %s" % (tbl, "OK" if hit else "缺失!"))
             ok = ok and hit
 
-        # 演示应用必须一条都不剩
-        for t in ("mxk_apps", "mxk_apps_cas_details", "mxk_apps_oauth_client_details", "mxk_access"):
+        # 演示应用与运行时数据必须一条都不剩
+        zero_expected = [
+            "mxk_apps", "mxk_apps_cas_details", "mxk_apps_oauth_client_details", "mxk_access",
+            "mxk_remember_me", "mxk_passkey_challenges", "mxk_user_passkeys",
+            "mxk_history_login", "mxk_history_login_apps", "mxk_history_system_logs",
+            "mxk_history_event", "mxk_connectors", "mxk_history_connector",
+            "mxk_history_provisions", "mxk_history_synchronizer", "mxk_synchronizers",
+            "mxk_synchro_association", "mxk_synchro_related",
+            "mxk_file_upload", "mxk_register",
+        ]
+        for t in zero_expected:
             n = sum(1 for l in body.split("\n") if re.match(r"^INSERT INTO %s\b" % t, l))
-            print("演示数据 %-28s %d 条  %s" % (t, n, "OK" if n == 0 else "应为 0"))
-            ok = ok and (n == 0)
+            if n != 0:
+                print("应为空 %-30s %d 条  失败" % (t, n))
+                ok = False
+        print("运行时/演示数据          %d 张表全部为 0 条  %s"
+              % (len(zero_expected), "OK" if ok else "有残留"))
 
         # 只允许 1 个用户
         n_user = sum(1 for l in body.split("\n") if re.match(r"^INSERT INTO mxk_userinfo", l))
