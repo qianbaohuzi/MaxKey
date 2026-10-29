@@ -59,7 +59,7 @@
 			"audit": {
 				"": "日志审计",
 				"logins": "登录日志",
-				"loginapps": "管理端审计日志",
+				"loginapps": "访问日志",
 				"synchronizer": "同步器日志",
 				"connector": "连接器日志",
 				"operate": "系统日志"

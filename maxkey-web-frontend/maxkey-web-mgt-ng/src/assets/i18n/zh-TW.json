@@ -60,7 +60,7 @@
 			"audit": {
 				"": "日誌審計",
 				"logins": "登錄日誌",
-				"loginapps": "管理端審計日誌",
+				"loginapps": "訪問日誌",
 				"synchronizer": "同步器日誌",
 				"connector": "連接器日誌",
 				"operate": "系統日誌"
