@@ -17,14 +17,13 @@ Wants=network-online.target
 #   而管理端对认证中心的真实依赖只是"启动时它已就绪"（CAS 登录需要），
 #   运行期两者各自独立；portal 短暂不可用时 mgt 自身仍能提供配置界面。
 #   所以用 After 表达顺序即可，不声明 Requires。
-#
-#   若现场确实要求两者严格同生共死，可自行加 Requires，但要清楚上面三点代价。
 
 [Service]
 Type=forking
 PIDFile=/opt/maxkey/run/maxkey-mgt.pid
-ExecStart=/opt/maxkey/bin/maxkeyctl.sh start mgt
-ExecStop=/opt/maxkey/bin/maxkeyctl.sh stop mgt
+# 指向 current 软链：切版本只改软链，不需要动 unit、也不需要 daemon-reload
+ExecStart=/opt/maxkey/current/bin/maxkeyctl.sh start mgt
+ExecStop=/opt/maxkey/current/bin/maxkeyctl.sh stop mgt
 RemainAfterExit=yes
 
 TimeoutStartSec=300
@@ -34,10 +33,10 @@ RestartSec=10
 
 User=maxkey
 Group=maxkey
-WorkingDirectory=/opt/maxkey
+WorkingDirectory=/opt/maxkey/current
 
-# 环境变量统一由 maxkeyctl.sh 从 conf/maxkey.env 加载，避免两套解析规则
-# 例外：数据库口令走独立密钥文件（仅一行 DATABASE_PWD=...，权限 600 root:root）
+# 环境变量统一由 maxkeyctl.sh 从 conf/maxkey.env 加载，避免两套解析规则。
+# 例外：数据库口令与 JWT 密钥走独立密钥文件（600 root:root）。
 EnvironmentFile=-/etc/maxkey/maxkey-secret.env
 Environment="LANG=zh_CN.UTF-8"
 
@@ -45,7 +44,14 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/maxkey_mgt/logs
+# 必须授权**解析后**的日志与 run 目录，并且 /opt/maxkey 本身要可读
+# （current 是软链，指向 releases/ 下的真实目录）。
+#
+# 踩过的坑：只写 /opt/maxkey/logs 时，若 maxkeyctl.sh 判定布局失败、
+# 试图往 /opt/maxkey/current/run 写 pid，会被 ProtectSystem=full 拒绝，
+# 而 mkdir -p 的失败被 2>/dev/null 吞掉，最终只看到
+#   "PID file ... not created" 这类毫无指向性的错误。
+ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/backups /opt/maxkey/releases
 
 StandardOutput=journal
 StandardError=journal

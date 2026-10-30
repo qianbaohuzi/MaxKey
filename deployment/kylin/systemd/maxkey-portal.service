@@ -1,7 +1,7 @@
 [Unit]
 Description=MaxKey SSO Portal (认证中心) 9527
 Documentation=https://www.maxkey.top
-# 数据库在本机时必须等待其就绪；Kingbase 通常由 systemd 管理，故声明弱依赖
+# 数据库在本机时必须等它就绪；Kingbase 通常由 systemd 管理，故声明弱依赖
 After=network-online.target kingbase.service
 Wants=network-online.target
 
@@ -9,8 +9,11 @@ Wants=network-online.target
 Type=forking
 # 用脚本自身做控制，避免 systemd 与脚本的 pid 记录两套并存
 PIDFile=/opt/maxkey/run/maxkey-portal.pid
-ExecStart=/opt/maxkey/bin/maxkeyctl.sh start portal
-ExecStop=/opt/maxkey/bin/maxkeyctl.sh stop portal
+# 关键：ExecStart 指向 current 软链，而不是具体版本目录。
+# 于是切换版本（upgrade.sh / rollback.sh 只改软链）无需改本文件、
+# 也无需 daemon-reload —— 这是版本目录布局能"原子切换"的前提。
+ExecStart=/opt/maxkey/current/bin/maxkeyctl.sh start portal
+ExecStop=/opt/maxkey/current/bin/maxkeyctl.sh stop portal
 RemainAfterExit=yes
 
 # 端口就绪判断交给脚本，这里给足超时（首次启动要建连接池、加载方言）
@@ -22,7 +25,7 @@ RestartSec=10
 # 以专用低权限用户运行，减小被攻击面
 User=maxkey
 Group=maxkey
-WorkingDirectory=/opt/maxkey
+WorkingDirectory=/opt/maxkey/current
 
 # 环境变量一律由 maxkeyctl.sh 自行 source conf/maxkey.env。
 # 这里**不再**用 EnvironmentFile 重复加载：systemd 的 EnvironmentFile 与
@@ -30,8 +33,8 @@ WorkingDirectory=/opt/maxkey
 # 含 & 的 URL，systemd 会保留引号字面量），两套解析并存容易出现
 # "手工启动正常、systemd 启动连错库" 这类难查问题。单一来源更可靠。
 #
-# 唯一例外：数据库口令不写入 conf/maxkey.env，改由独立密钥文件注入。
-# 该文件仅一行 DATABASE_PWD=...，无引号/转义歧义，可安全交给 systemd 解析。
+# 唯一例外：数据库口令与 JWT 密钥放在独立密钥文件里
+# （仅 KEY=VALUE 行，无引号/转义歧义，可安全交给 systemd 解析）。
 # 权限应为 600 root:root。前缀 - 表示文件不存在时不报错，
 # 由 maxkeyctl.sh 在启动时显式拦截并给出注入提示。
 EnvironmentFile=-/etc/maxkey/maxkey-secret.env
@@ -42,7 +45,16 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/maxkey/logs
+# 日志已集中到 /opt/maxkey/logs/{portal,mgt}（版本目录内的 logs 是软链），
+# 故只需授权这一个日志目录 + run + backups。
+# 必须授权**解析后**的日志与 run 目录，并且 /opt/maxkey 本身要可读
+# （current 是软链，指向 releases/ 下的真实目录）。
+#
+# 踩过的坑：只写 /opt/maxkey/logs 时，若 maxkeyctl.sh 判定布局失败、
+# 试图往 /opt/maxkey/current/run 写 pid，会被 ProtectSystem=full 拒绝，
+# 而 mkdir -p 的失败被 2>/dev/null 吞掉，最终只看到
+#   "PID file ... not created" 这类毫无指向性的错误。
+ReadWritePaths=/opt/maxkey/logs /opt/maxkey/run /opt/maxkey/backups /opt/maxkey/releases
 
 StandardOutput=journal
 StandardError=journal

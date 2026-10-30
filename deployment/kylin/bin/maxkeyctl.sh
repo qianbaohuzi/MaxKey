@@ -17,13 +17,57 @@
 ############################################################################
 
 set -u
+set -o pipefail
 
 BASE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CONF_FILE="${BASE_DIR}/conf/maxkey.env"
-RUN_DIR="${BASE_DIR}/run"
-LOG_DIR="${BASE_DIR}/logs"
 
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+# ---------------------------------------------------------------- 布局适配 --
+# 新布局：程序在 <root>/releases/<版本>/，current 软链指向它，而
+#   conf/ logs/ run/ 是**跨版本共享**的（在 <root> 下）。
+# 本脚本放在 release 内（随代码走，保证启动参数与 jar 版本匹配），
+# 所以运行时目录必须解析到共享位置，否则：
+#   * pid 写进版本目录，systemd 的 PIDFile 找不到 → 服务"启动成功但立即退"
+#   * 日志留在版本目录里，回滚后旧日志"消失"
+# 旧布局（程序直接在 <root> 下）保持原行为。
+# 判定必须基于**物理路径**：systemd 调的是 /opt/maxkey/current/bin/maxkeyctl.sh，
+# 此时 BASE_DIR=/opt/maxkey/current（软链），dirname 是 /opt/maxkey 而不是 releases，
+# 用逻辑路径判断会漏判 —— 后果是 pid 与日志写进 current/run、current/logs，
+# 在 systemd 的 ProtectSystem=full 下 /opt 只读，直接报
+#   /opt/maxkey/current/run/maxkey-portal.pid: No such file or directory
+# 而"没权限创建目录"被 mkdir -p 的 2>/dev/null 吞掉了，只剩一句没有 pid 文件，
+# 极难归因。
+REAL_BASE=$(readlink -f "$BASE_DIR")
+if [ "$(basename "$(dirname "$REAL_BASE")")" = "releases" ]; then
+    SHARED_DIR=$(cd "$(dirname "$REAL_BASE")/.." && pwd)
+    SHARED_LAYOUT=1
+else
+    SHARED_DIR="$REAL_BASE"
+    SHARED_LAYOUT=0
+fi
+
+CONF_FILE="${BASE_DIR}/conf/maxkey.env"
+RUN_DIR="${SHARED_DIR}/run"
+LOG_DIR="${SHARED_DIR}/logs"
+
+# 内置 jre 也是跨版本共享的（64MB，不在每个 release 里复制一份）。
+# 先看包内（旧布局/单目录部署），再看共享位置（新布局）。
+if [ -x "${SHARED_DIR}/jre/bin/java" ]; then
+    JRE_HOME="${SHARED_DIR}/jre"
+else
+    JRE_HOME="${BASE_DIR}/jre"
+fi
+
+# 不能静默吞掉创建失败：那会让后面"pid 文件不存在"成为唯一线索。
+for d in "$RUN_DIR" "$LOG_DIR"; do
+    if ! mkdir -p "$d" 2>/dev/null; then
+        echo "ERROR: 无法创建 ${d}"
+        echo "       检查属主（应为 maxkey:maxkey）与 systemd 的 ReadWritePaths"
+        echo "       当前用户: $(id -un 2>/dev/null || echo '?')"
+        exit 1
+    fi
+    [ -w "$d" ] || { echo "ERROR: ${d} 不可写（当前用户 $(id -un 2>/dev/null || echo '?')）"; exit 1; }
+done
+
 
 # set -a 让 conf 中的变量自动 export，否则 DATABASE_URL/SERVER_DOMAIN 等
 # 只是 shell 局部变量，不会传给 java 子进程，Spring 会静默回落到代码内置默认值
@@ -77,6 +121,30 @@ if [ -z "$MAXKEY_PUBLIC_URL" ]; then
 fi
 export MAXKEY_PUBLIC_URL
 
+# 管理端 CAS 免密登录的两个地址在 conf 里是
+#   LOGIN_CAS_SERVER="http://127.0.0.1:${PORTAL_PORT:-9527}/sign/authz/cas"
+#   LOGIN_CAS_SERVICE="${MAXKEY_PUBLIC_URL}/maxkey-mgt/#/passport/trust/auth"
+# 后者**在 source 时**就展开。若 conf 里 MAXKEY_PUBLIC_URL 留空、靠上面这段
+# 按 SERVER_DOMAIN 推导，它就会变成残缺的 "/maxkey-mgt/#/..."（没有协议和主机），
+# serviceValidate 比对必然失败。故这里在派生完成后做一次兜底。
+if [ -n "$MAXKEY_PUBLIC_URL" ]; then
+    case "${LOGIN_CAS_SERVER:-}" in
+        http://*|https://*) ;;
+        *)
+            LOGIN_CAS_SERVER="http://127.0.0.1:${PORTAL_PORT:-9527}/sign/authz/cas"
+            echo "WARN: LOGIN_CAS_SERVER 未配置或不完整，已回退为 ${LOGIN_CAS_SERVER}"
+            ;;
+    esac
+    case "${LOGIN_CAS_SERVICE:-}" in
+        http://*|https://*) ;;
+        *)
+            LOGIN_CAS_SERVICE="${MAXKEY_PUBLIC_URL}/maxkey-mgt/#/passport/trust/auth"
+            echo "WARN: LOGIN_CAS_SERVICE 未配置或不完整，已按对外地址重建为 ${LOGIN_CAS_SERVICE}"
+            ;;
+    esac
+    export LOGIN_CAS_SERVER LOGIN_CAS_SERVICE
+fi
+
 # maxkey.server.scheme 在 properties 中是写死的 http，无法用环境变量覆盖，
 # 故启动时用 -D 显式下发（-D 优先级高于 application.properties）
 SPRING_EXTRA_OPTS="-Dmaxkey.server.scheme=${MAXKEY_SCHEME}"
@@ -115,6 +183,22 @@ if [ -n "${DATABASE_DRIVER:-}" ] && [ -z "${DATABASE_PWD:-}" ]; then
     echo "         systemd: [Service] 段加 EnvironmentFile=-/etc/maxkey/maxkey-secret.env"
     echo "                  （该文件 600，内容仅一行 DATABASE_PWD='实际口令'）"
     echo "         手工启动: export DATABASE_PWD='实际口令' && ./bin/maxkeyctl.sh start"
+    exit 1
+fi
+
+# JWT 密钥同理：4.2.0 起从 jar 内的明文常量改为环境变量注入
+# （原先是 512 字符字面量写在两个 properties 里，任何人 unzip jar 就能
+#  拿到并伪造任意用户 token）。缺它时 @Value("${maxkey.auth.jwt.secret}")
+# 没有默认值，应用会在启动阶段就抛 IllegalArgumentException。
+#
+# 同源要求：portal 与 mgt 必须用**同一个**密钥，否则两边签发的 token
+# 互不认可（表现为登录成功但立刻被踢回登录页）。
+if [ -z "${JWT_SECRET:-}" ]; then
+    echo "ERROR: JWT_SECRET 未注入（portal 与 mgt 必须使用同一个值）"
+    echo "       由安装脚本生成，位于 /etc/maxkey/maxkey-secret.env："
+    echo "         JWT_SECRET='<512 字符随机串>'"
+    echo "       手工启动时："
+    echo "         export JWT_SECRET=\"\$(sed -n 's/^JWT_SECRET=//p' /etc/maxkey/maxkey-secret.env)\""
     exit 1
 fi
 
@@ -162,7 +246,7 @@ find_java() {
         echo "WARN: MAXKEY_JAVA=${MAXKEY_JAVA} 不存在或不可执行，忽略" >&2
     fi
     # 1) 发布包内置运行时
-    if [ -x "${BASE_DIR}/jre/bin/java" ]; then echo "${BASE_DIR}/jre/bin/java"; return 0; fi
+    if [ -x "${JRE_HOME}/bin/java" ]; then echo "${JRE_HOME}/bin/java"; return 0; fi
     # 2) 显式指定的 JAVA_HOME
     if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
         cand="${JAVA_HOME}/bin/java"
@@ -207,7 +291,7 @@ runtime_selfcheck() {
 
     # 系统 JDK（非 jlink 产物）模块齐全，不必探测。
     case "$jvm" in
-        "${BASE_DIR}/jre/bin/java") ;;
+        "${JRE_HOME}/bin/java") ;;
         *) return 0 ;;
     esac
 
@@ -215,7 +299,7 @@ runtime_selfcheck() {
 
     # 编译用的 javac：裁剪运行时通常没有，需借外部 JDK。
     javac_bin=""
-    for c in "${BASE_DIR}/jre/bin/javac" "$(dirname "$jvm")/javac" "$(command -v javac 2>/dev/null)"; do
+    for c in "${JRE_HOME}/bin/javac" "$(dirname "$jvm")/javac" "$(command -v javac 2>/dev/null)"; do
         [ -n "$c" ] && [ -x "$c" ] && { javac_bin="$c"; break; }
     done
 
