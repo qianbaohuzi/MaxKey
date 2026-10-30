@@ -404,7 +404,19 @@ else
         # reset-failed：上一次失败的 restart 可能留下 failed 状态，
         # 直接 restart 会被 systemd 拒绝或表现怪异。
         systemctl reset-failed $UNITS 2>/dev/null || true
-        systemctl restart $UNITS
+        # 同 install.sh：set -e 下裸调 systemctl，失败会静默退出，
+        # 看不到任何失败原因。必须接住退出码并把 systemd 状态打出来。
+        if ! systemctl restart $UNITS; then
+            printf '\n\033[1;31msystemctl restart 失败\033[0m\n\n'
+            for u in $UNITS; do
+                printf '  ---- %s ----\n' "$u"
+                systemctl status "$u" --no-pager -l 2>&1 | sed -n '1,12p' | sed 's/^/    /'
+            done
+            printf '\n  启动输出（java 的 stdout）:\n'
+            printf '    tail -50 %s/portal/nohup-portal.out\n' "$LOG_DIR"
+            printf '    tail -50 %s/mgt/nohup-mgt.out\n' "$LOG_DIR"
+            RC=1
+        fi
 
         if health_check "${PORTAL_PORT}" "${MGT_PORT}" \
                 "${MAXKEY_PUBLIC_URL}" "${NGINX_SERVER_NAME}" "${NGINX_TLS_PORT:-443}"; then

@@ -141,15 +141,28 @@ else
     run cp -a "$RENDERED" "${CONF_DIR}/maxkey.env"
     info "已写入 ${CONF_DIR}/maxkey.env（模板 + profile ${PROFILE}）"
 fi
-rm -f "$RENDERED"
-
-# 校验以"最终生效的那份"为准 —— 现场手改过的值才是真的
+# 校验以"最终生效的那份"为准 —— 现场手改过的值才是真的。
+#
+# 但「新机器 + --dry-run」这一组合下，上面是 `run cp`，只打印不执行，
+# CONF_DIR 里并没有文件。此时必须退回**刚渲染出来的那份**（$RENDERED），
+# 而不是退回环境档案 —— 档案只写"这台机器与别人不同的项"，
+# 缺 LOGIN_CAS_SERVICE / LOGIN_CAS_SERVER 这类由模板派生的键，
+# 于是会误报
+#     [FAIL] LOGIN_CAS_SERVICE 必须由 MAXKEY_PUBLIC_URL 派生（当前: 未设置）
+# 这个 bug 只在"dry-run 首装"时出现（真装会写出文件、老机器文件已存在），
+# 所以本机回归与二次安装都测不出来 —— 正是它躲过验证的原因。
 if [ -f "${CONF_DIR}/maxkey.env" ]; then
     load_env_file "${CONF_DIR}/maxkey.env"
+elif [ -f "$RENDERED" ]; then
+    info "校验依据：刚渲染的配置（dry-run 尚未落盘）"
+    load_env_file "$RENDERED"
 else
     load_env_file "$PROFILE_FILE"
 fi
 check_site_consistency
+
+# 校验完才能删：删早了就只剩档案可用
+rm -f "$RENDERED"
 
 # ------------------------------------------------------ 布局冲突检测 ----
 say "布局检测"
@@ -639,7 +652,39 @@ if [ "$DO_START" = "1" ]; then
     if [ "$DRY_RUN" = "1" ]; then
         printf '    [dry-run] systemctl restart %s\n' "$UNITS"
     else
-        systemctl restart $UNITS
+        # 不能裸调：本脚本是 set -e，systemctl 返回非 0 时脚本会**静默退出**，
+        # 既不打错误也不进健康检查 —— 现场看到的就是"==> 启动服务"后直接结束，
+        # 没有任何可排查的信息。这就是真实发生过的那次事故。
+        # 必须显式接住退出码，把 systemd 的失败原因打出来再决定。
+        if ! systemctl restart $UNITS; then
+            printf '\n\033[1;31msystemctl restart 失败\033[0m，服务未能启动。\n\n'
+            for u in $UNITS; do
+                printf '  ---- %s ----\n' "$u"
+                systemctl status "$u" --no-pager -l 2>&1 | sed -n '1,12p' | sed 's/^/    /'
+            done
+            cat <<EOF
+
+  最常见原因与处理：
+
+    1. 数据库口令不对（启动时连库失败）
+         vi ${SECRET_FILE}          # 确认 DATABASE_PWD
+         systemctl restart ${UNITS}
+
+    2. 库里没有表（漏了 --init-db）
+         sudo ./install.sh --profile ${PROFILE} --init-db --force-reinstall
+
+    3. 端口被旧进程占用
+         ss -lntp | grep -E ':${PORTAL_PORT}|:${MGT_PORT}'
+
+    4. 看启动输出（java 的 stdout 在这里）
+         tail -50 ${LOG_DIR}/portal/nohup-portal.out
+         tail -50 ${LOG_DIR}/mgt/nohup-mgt.out
+
+    修好后重试启动：
+         systemctl restart ${UNITS}
+EOF
+            exit 1
+        fi
         info "systemctl restart 已执行"
         if ! health_check "${PORTAL_PORT}" "${MGT_PORT}" \
                 "${MAXKEY_PUBLIC_URL}" "${NGINX_SERVER_NAME}" "${NGINX_TLS_PORT:-443}"; then

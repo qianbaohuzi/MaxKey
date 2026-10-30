@@ -351,7 +351,19 @@ else
         printf '    [dry-run] systemctl restart %s\n' "$UNITS"
     else
         systemctl reset-failed $UNITS 2>/dev/null || true
-        systemctl restart $UNITS
+        # 同 install.sh：set -e 下裸调 systemctl，失败会静默退出，
+        # 看不到任何失败原因。必须接住退出码并把 systemd 状态打出来。
+        if ! systemctl restart $UNITS; then
+            printf '\n\033[1;31msystemctl restart 失败\033[0m\n\n'
+            for u in $UNITS; do
+                printf '  ---- %s ----\n' "$u"
+                systemctl status "$u" --no-pager -l 2>&1 | sed -n '1,12p' | sed 's/^/    /'
+            done
+            printf '\n  启动输出（java 的 stdout）:\n'
+            printf '    tail -50 %s/portal/nohup-portal.out\n' "$LOG_DIR"
+            printf '    tail -50 %s/mgt/nohup-mgt.out\n' "$LOG_DIR"
+            RC=1
+        fi
 
         # 回滚后的健康检查必须用"目标版本当时的配置"来判，
         # 所以重新 load 一次 conf（可能刚被还原成旧值）。

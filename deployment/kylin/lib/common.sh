@@ -429,7 +429,16 @@ EOF
 # 理由：麒麟最小化安装常常没有 logrotate / rsync，但这不该挡住部署；
 # 而缺 useradd/systemctl/nginx（当需要时）是真装不上。
 require_hard() {
-    command -v "$1" >/dev/null 2>&1 || die "缺少必需命令: $1（$2）"
+    command -v "$1" >/dev/null 2>&1 && return 0
+    # dry-run 的价值就在于"不需要 root 也能在任意机器上预演"：
+    # 此时 useradd/systemctl 这类命令可能因权限或最小化安装而不可见，
+    # 但它们是否可用，只有真装时才有意义。这里降级为告警，
+    # 否则 `--dry-run` 会在检查阶段就退出，演练失去意义。
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        warn "dry-run：未找到 $1（$2）—— 真装时若缺失会中止"
+        return 0
+    fi
+    die "缺少必需命令: $1（$2）"
 }
 
 require_soft() {
