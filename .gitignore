@@ -81,3 +81,6 @@ maxkey-secret.env
 !deployment/kylin/bin/
 !deployment/kylin/bin/**
 __pycache__/
+
+# release-remote.sh 的目标机注册表（含内网地址，不入库）
+.remote-targets

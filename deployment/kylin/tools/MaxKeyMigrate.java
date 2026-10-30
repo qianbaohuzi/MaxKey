@@ -169,16 +169,40 @@ public final class MaxKeyMigrate {
                 .invoke(target, a);
     }
 
+    /**
+     * 打印迁移结果摘要。
+     *
+     * MigrateResult 的字段是 **public 字段**而不是 getter（Flyway 10+ 如此），
+     * 用 getMethod("migrationsExecuted") 会抛 NoSuchMethodException，
+     * 于是退化成一句"细节字段不可读"—— 信息就丢了。这里两种都试：
+     * 先找 getter，找不到再直接读 public 字段。
+     */
     private static void printMigrateResult(Object r) {
+        String applied = readMember(r, "migrationsExecuted");
+        String target  = readMember(r, "targetSchemaVersion");
+        String initial = readMember(r, "initialSchemaVersion");
+        if (applied != null) {
+            System.out.println("迁移结果: 执行 " + applied + " 条迁移"
+                    + (initial != null && target != null ? "，" + initial + " -> " + target : ""));
+        } else {
+            System.out.println("迁移结果: 已完成");
+        }
+    }
+
+    /** 先试 getXxx()，再试同名字段；都没有返回 null。 */
+    private static String readMember(Object obj, String name) {
         try {
-            Class<?> c = r.getClass();
-            Object applied = c.getMethod("migrationsExecuted").invoke(r);
-            Object target  = c.getMethod("targetSchemaVersion").invoke(r);
-            Object initial = c.getMethod("initialSchemaVersion").invoke(r);
-            System.out.println("迁移结果: 执行 " + applied + " 条，"
-                    + initial + " -> " + target);
+            Object v = obj.getClass().getMethod(name).invoke(obj);
+            return v == null ? null : String.valueOf(v);
+        } catch (Exception ignore) {
+            // fall through to field
+        }
+        try {
+            java.lang.reflect.Field f = obj.getClass().getField(name);
+            Object v = f.get(obj);
+            return v == null ? null : String.valueOf(v);
         } catch (Exception e) {
-            System.out.println("迁移结果: 已完成（细节字段不可读: " + e.getMessage() + "）");
+            return null;
         }
     }
 

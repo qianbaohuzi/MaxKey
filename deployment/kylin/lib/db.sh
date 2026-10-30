@@ -129,7 +129,13 @@ db_exec_sql() {
 }
 
 db_query_one() {
-    db_exec_sql "$1" | head -1 | tr -d ' \r'
+    # 只取第一行；失败时输出空串（不把异常栈当结果返回）
+    local out
+    out=$(db_exec_sql "$1" 2>/dev/null | head -1 | tr -d ' \r') || true
+    case "$out" in
+        Exception*|"Error:"*) printf '' ;;
+        *) printf '%s' "$out" ;;
+    esac
 }
 
 db_table_count() {
@@ -317,11 +323,17 @@ db_flyway_run() {
         "$@"
 }
 
-# 已应用的最高版本号（无历史表则输出空）
+# 已应用的最高版本号（无历史表则输出空）。
+#
+# 必须先判断历史表存在再查：直接查不存在的表会抛 PSQLException，
+# 异常栈会混进 stdout（调用方用 2>/dev/null 只能吞 stderr），
+# 表现为 "当前数据库版本: Exception in thread main ... relation does not exist"
+# —— 看起来像脚本崩了，其实只是"还没迁移过"。
 db_flyway_version() {
-    local v
-    v=$(db_query_one "select version from maxkey_schema_history where success order by installed_rank desc limit 1" 2>/dev/null || echo "")
-    printf '%s' "$v"
+    if ! db_flyway_has_history; then
+        return 0
+    fi
+    db_query_one "select version from maxkey_schema_history where success order by installed_rank desc limit 1" 2>/dev/null || true
 }
 
 db_flyway_has_history() {
