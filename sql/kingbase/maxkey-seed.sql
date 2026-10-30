@@ -5,8 +5,17 @@
 --   表结构 **完全一致**（44 张表、全部索引/约束/注释/序列），不做任何删减。
 --   INSERT 只保留登录与管理端菜单的最小闭环：
 --     * mxk_userinfo 仅 admin 一行（完整版有 60 个演示用户，共 16MB 头像）
---     * mxk_apps 保留 34 个演示应用的**配置**，icon 字段置 NULL（省 1.5MB）
+--     * 演示应用（mxk_apps 及各协议明细、mxk_access）全部不导入
+--     * **仅保留管理端自身**这一个 CAS 应用（3 行），地址按对外地址生成
 --     * 演示登录历史 / 系统日志 / 同步记录类全部丢弃
+--
+-- 管理端应用地址: https://sso.maxkey.top
+--   loginurl    https://sso.maxkey.top/maxkey-mgt/
+--   service     https://sso.maxkey.top/maxkey-mgt/#/passport/trust/auth
+--
+--   换域名后**必须**同步改这三行（或重新生成本文件），否则门户「后台」
+--   菜单会因应用不存在而报错。另外 mgt 侧 conf/maxkey.env 的
+--   LOGIN_CAS_SERVER / LOGIN_CAS_SERVICE 也要指向同一地址。
 --
 -- 建库：
 --   ksql -U maxkey -d maxkey -f maxkey-seed.sql
@@ -2051,4 +2060,25 @@ INSERT INTO mxk_socials_provider (id, provider, providername, icon, clientid, cl
 INSERT INTO mxk_socials_provider (id, provider, providername, icon, clientid, clientsecret, agentid, display, sortindex, scancode, status, createdby, createddate, modifiedby, modifieddate, instid) VALUES (E'9', E'facebook', E'Facebook', E'assets/social/facebook.png', E'appKey', E'$2a$10$dNwwCB4sdVtCKLmKzy0boubff8df2d163806a9dc7a9b548115dc4acc8e890374cebf3f06cbc94776dbf407', E'none', E'true', 9, E'false', 1, NULL, NULL, NULL, NULL, E'1');
 ALTER TABLE mxk_synchro_association ALTER COLUMN id RESTART WITH 210;
 INSERT INTO mxk_userinfo (id, username, password, decipherable, authntype, mobile, mobileverified, email, emailverified, displayname, nickname, picture, timezone, locale, preferredlanguage, passwordquestion, passwordanswer, apploginauthntype, apploginpassword, protectedapps, theme, gridlist, logincount, "online", status, islocked, unlocktime, lastloginip, lastlogintime, lastlogofftime, badpasswordtime, badpasswordcount, passwordlastsettime, passwordsettype, sharedsecret, sharedcounter, usertype, userstate, employeenumber, windowsaccount, division, costcenter, organization, departmentid, department, jobtitle, joblevel, managerid, manager, assistantid, assistant, entrydate, startworkdate, quitdate, sortindex, workemail, workphonenumber, workcountry, workregion, worklocality, workstreetaddress, workaddressformatted, workpostalcode, workfax, workofficename, givenname, middlename, familyname, honorificprefix, honorificsuffix, formattedname, idtype, idcardno, education, graduatefrom, graduatedate, married, birthdate, namezhspell, namezhshortspell, gender, website, weixinfollow, defineim, homeemail, homephonenumber, homecountry, homeregion, homelocality, homestreetaddress, homeaddressformatted, homepostalcode, homefax, extraattribute, createdby, createddate, modifiedby, modifieddate, description, ldapdn, instid, regionhistory, passwordhistory) VALUES (E'1', E'admin', E'{plain}maxkey', E'', 0, E'15618726256', E'0', E'shimingxy@qq.com', 0, E'系统管理员', E'系统管理员', NULL, E'Asia/Shanghai', E'de', E'zh_CN', E'5', E'wusdfdsf', 0, E'96ba45115416faf22791c13ade20f437', E',41065fe3-ae67-4172-a460-fd0079e88294,52f0002d-4ef7-4b27-8c5b-41b9ee80835d,3f57d0b2-99ab-4e66-a938-718befb55369', E'default', 0, 1840, 0, 1, 1, E'2022-05-18 03:58:47', E'0:0:0:0:0:0:0:1', E'2026-07-20 20:06:04', E'2026-07-20 20:10:00', E'2023-10-11 11:29:06', 0, E'2022-04-25 20:12:05', 0, E'$2a$10$B.lYrMtrkjHhK4qBPhtf.ec3d523ce1a4e4d1453f56d94f2ea5d4d76a5688d16b5fc9e8b71810a66b5016c6556dc432c7dd48eb4417c67b4c34fad7346bcf52de3acf8', NULL, E'EMPLOYEE', E'RESIDENT', E'2099001', E'adsystemadmin', NULL, NULL, E'总部', E'105', E'科技部', E'系统管理员', NULL, E'22222', E'科技部经理', NULL, NULL, NULL, NULL, NULL, 0, E'admin@QxzyC82JWA-mail.com', E'123123', E'AFG', E'北京', E'北京', E'北京', NULL, E'123123', E'123123', NULL, E'admin', E'admin', E'admin', NULL, NULL, NULL, 1, E'2342342343242344234', E'', E'', NULL, 1, NULL, NULL, NULL, 1, E'http://login.maxkey.org/', NULL, NULL, E'admin@qq.com', E'123123', E'AFG', E'北京', E'北京', E'北京', NULL, E'123123', E'sdf', NULL, NULL, E'2014-01-21 00:00:00', NULL, E'2025-07-27 11:45:09', NULL, NULL, E'1', NULL, NULL);
+
+INSERT INTO mxk_apps (
+  id, appname, loginurl, category, secret, protocol, icon, status,
+  createdby, createddate, modifiedby, modifieddate, description, vendor, vendorurl,
+  credential, sharedusername, sharedpassword, systemuserattr, isextendattr, extendattr,
+  sortindex, issignature, visible, isadapter, adapterid, adaptername, adapter,
+  principal, credentials, userpropertys, inducer, logouturl, logouttype,
+  instid, frequently, resourcemgt, openapiright
+) VALUES (
+  '622076759805923328', 'MaxKey管理系统', 'https://sso.maxkey.top/maxkey-mgt/', 'none', '$2a$10$NxCPqq1lYxvQ/ltrOeNmWO812ff6ed00de587a3850b541ac2ab23b0ceff2eb105486bf1f5ca181f3a6a1f557fdd6f9c5a3233381cb5cee9c2f0944c388b06de7cfd529', 'CAS', NULL, 1,
+  NULL, now(), '1', now(), '', '', '',
+  'none', NULL, NULL, NULL, '0', NULL,
+  8, 0, 0, 1, '622227747946762291', 'CAS默认适配器',
+  'org.dromara.maxkey.authz.cas.adapter.CasDefaultAdapter',
+  NULL, NULL, 'username', 'IDP', '', 0,
+  '1', 'no', 'y', 'read'
+);
+INSERT INTO mxk_apps_cas_details (id, service, callbackurl, expires, instid, casuser)
+VALUES ('622076759805923328', 'https://sso.maxkey.top/maxkey-mgt/#/passport/trust/auth', 'https://sso.maxkey.top/maxkey-mgt/#/passport/trust/auth', 300, '1', 'username');
+INSERT INTO mxk_access (id, groupid, appid, createddate, instid)
+VALUES ('1037500516352917504', 'ROLE_ADMINISTRATORS', '622076759805923328', now(), '1');
 

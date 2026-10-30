@@ -97,14 +97,18 @@ KEEP_TABLES = {
 #     * 13 条 issuer 为空 → id_token 没有 iss 声明（OIDC 规范要求必须有）
 #   真实接入时应在管理端按需新建，字段结构可参考部署文档。
 EMPTY_TABLES = {
-    "mxk_apps",                          # 应用主表
+    # 这四张表里的**演示行**一条都不要。但注意：管理端自身也是一个 CAS 应用，
+    # 它那三行（apps / cas_details / access）必须存在，否则门户「后台」菜单
+    # 跳 /sign/authz/maxkey_mgt 会 500。这三行不来自 dump，由本脚本按现场
+    # 地址单独生成后追加，见 build_mgt_app_rows()。
+    "mxk_apps",                          # 应用主表（演示行全部丢弃）
     "mxk_apps_cas_details",              # 各协议明细表
     "mxk_apps_saml_v20_details",
     "mxk_apps_jwt_details",
     "mxk_apps_token_based_details",
     "mxk_apps_form_based_details",
     "mxk_apps_oauth_client_details",
-    "mxk_access",                        # 应用授权行（应用没了就是孤儿）
+    "mxk_access",                        # 应用授权行
 
     # --- 会话 / 登录态 ---
     # 这些是运行时产生的状态，交付一个干净实例时不应带任何历史。
@@ -164,10 +168,90 @@ def strip_blob(line):
     return BLOB_RE.sub("NULL", line)
 
 
+# ---------------------------------------------------------------------------
+# 管理端自身作为一个 CAS 应用
+# ---------------------------------------------------------------------------
+# 门户菜单「后台」→ /authz/mgt → 前端 window.location 跳 /sign/authz/maxkey_mgt，
+# 后端 AppsServiceImpl.get() 把 "maxkey_mgt" 这个字面量换成**硬编码**的应用 ID：
+#
+#     public static final String MGT_APP_ID = "622076759805923328";
+#
+# 所以这三行数据缺一不可，缺了会 500：
+#   mxk_apps              应用主表（protocol=CAS，adapter 指向 CAS 默认适配器）
+#   mxk_apps_cas_details  CAS 明细（service / callbackurl）
+#   mxk_access            授权行（仅 ROLE_ADMINISTRATORS）
+#
+# 为什么不能直接从 dump 抄：
+#   官方 dump 里这三行指向演示域名 http://mgt.maxkey.top/maxkey-mgt，
+#   而且 callbackurl 少了 hash 路由（mgt 前端是 useHash:true），
+#   即使域名通，ticket 也传不进 /#/passport/trust/auth，登录必然失败。
+#
+# 因此这里按现场地址重新生成，地址来自 MAXKEY_PUBLIC_URL
+# （install.sh 在导入前还会按 conf/maxkey.env 再改写一次，见 install.sh）。
+MGT_APP_ID = "622076759805923328"
+# CAS 默认适配器。注意 dump 里那行 mgt 应用写的是 622227747946762290，
+# 那是「OAuth 2.0默认适配器」的 ID —— 上游数据本身的串行错误。
+# protocol=CAS 必须配 CAS 适配器 622227747946762291。
+MGT_CAS_ADAPTER_ID = "622227747946762291"
+# 管理端 secret 沿用 dump 原值（BCrypt 摘要），不是明文口令，改它没有意义
+MGT_APP_SECRET = (
+    "$2a$10$NxCPqq1lYxvQ/ltrOeNmWO812ff6ed00de587a3850b541ac2ab23b0ceff2eb105486bf1f"
+    "5ca181f3a6a1f557fdd6f9c5a3233381cb5cee9c2f0944c388b06de7cfd529"
+)
+MGT_ACCESS_ID = "1037500516352917504"
+
+DEFAULT_PUBLIC_URL = "https://sso.maxkey.top"
+
+
+def build_mgt_app_rows(public_url):
+    """生成管理端 CAS 应用的三个 INSERT。
+
+    public_url 末尾不带斜杠，例如 https://sso.example.com:9443
+    """
+    base = public_url.rstrip("/")
+    # mgt 前端是 hash 路由，ticket 必须落在 #/ 之后才能被
+    # TrustAuthComponent 从 queryParams 读到
+    trust = "%s/maxkey-mgt/#/passport/trust/auth" % base
+    login_url = "%s/maxkey-mgt/" % base
+
+    apps_sql = """INSERT INTO mxk_apps (
+  id, appname, loginurl, category, secret, protocol, icon, status,
+  createdby, createddate, modifiedby, modifieddate, description, vendor, vendorurl,
+  credential, sharedusername, sharedpassword, systemuserattr, isextendattr, extendattr,
+  sortindex, issignature, visible, isadapter, adapterid, adaptername, adapter,
+  principal, credentials, userpropertys, inducer, logouturl, logouttype,
+  instid, frequently, resourcemgt, openapiright
+) VALUES (
+  '{app_id}', 'MaxKey管理系统', '{login_url}', 'none', '{secret}', 'CAS', NULL, 1,
+  NULL, now(), '1', now(), '', '', '',
+  'none', NULL, NULL, NULL, '0', NULL,
+  8, 0, 0, 1, '{adapter_id}', 'CAS默认适配器',
+  'org.dromara.maxkey.authz.cas.adapter.CasDefaultAdapter',
+  NULL, NULL, 'username', 'IDP', '', 0,
+  '1', 'no', 'y', 'read'
+);""".format(app_id=MGT_APP_ID, login_url=login_url, secret=MGT_APP_SECRET,
+             adapter_id=MGT_CAS_ADAPTER_ID)
+
+    cas_sql = """INSERT INTO mxk_apps_cas_details (id, service, callbackurl, expires, instid, casuser)
+VALUES ('{app_id}', '{trust}', '{trust}', 300, '1', 'username');""".format(
+        app_id=MGT_APP_ID, trust=trust)
+
+    access_sql = """INSERT INTO mxk_access (id, groupid, appid, createddate, instid)
+VALUES ('{access_id}', 'ROLE_ADMINISTRATORS', '{app_id}', now(), '1');""".format(
+        access_id=MGT_ACCESS_ID, app_id=MGT_APP_ID)
+
+    return [apps_sql, cas_sql, access_sql]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true", help="生成后做自检")
+    ap.add_argument("--public-url",
+                    default=os.environ.get("MAXKEY_PUBLIC_URL") or DEFAULT_PUBLIC_URL,
+                    help="对外地址，用于生成管理端 CAS 应用的 loginurl/service，"
+                         "默认取环境变量 MAXKEY_PUBLIC_URL，再退回 %s" % DEFAULT_PUBLIC_URL)
     args = ap.parse_args()
+    public_url = args.public_url.rstrip("/")
 
     if not os.path.exists(SRC):
         sys.exit("ERROR: 源文件不存在: %s" % SRC)
@@ -213,6 +297,13 @@ def main():
 
     body = "\n".join(out)
 
+    # 管理端 CAS 应用的三行（dump 里没有可用版本，见 build_mgt_app_rows）
+    mgt_rows = build_mgt_app_rows(public_url)
+    body = body.rstrip("\n") + "\n\n" + "\n".join(mgt_rows) + "\n"
+    stats["mxk_apps"] = stats.get("mxk_apps", 0) + 1
+    stats["mxk_apps_cas_details"] = stats.get("mxk_apps_cas_details", 0) + 1
+    stats["mxk_access"] = stats.get("mxk_access", 0) + 1
+
     header = """-- MaxKey 4.2.0 KingbaseES 最小种子库脚本
 -- 由 sql/kingbase/make-seed.py 从 maxkey.sql 裁剪生成，请勿手工修改
 --
@@ -220,16 +311,25 @@ def main():
 --   表结构 **完全一致**（44 张表、全部索引/约束/注释/序列），不做任何删减。
 --   INSERT 只保留登录与管理端菜单的最小闭环：
 --     * mxk_userinfo 仅 admin 一行（完整版有 60 个演示用户，共 16MB 头像）
---     * mxk_apps 保留 34 个演示应用的**配置**，icon 字段置 NULL（省 1.5MB）
+--     * 演示应用（mxk_apps 及各协议明细、mxk_access）全部不导入
+--     * **仅保留管理端自身**这一个 CAS 应用（3 行），地址按对外地址生成
 --     * 演示登录历史 / 系统日志 / 同步记录类全部丢弃
+--
+-- 管理端应用地址: {public_url}
+--   loginurl    {public_url}/maxkey-mgt/
+--   service     {public_url}/maxkey-mgt/#/passport/trust/auth
+--
+--   换域名后**必须**同步改这三行（或重新生成本文件），否则门户「后台」
+--   菜单会因应用不存在而报错。另外 mgt 侧 conf/maxkey.env 的
+--   LOGIN_CAS_SERVER / LOGIN_CAS_SERVICE 也要指向同一地址。
 --
 -- 建库：
 --   ksql -U maxkey -d maxkey -f maxkey-seed.sql
 --
--- 初始账号：admin / maxkey   （mxk_userinfo.password 为 {plain}maxkey）
+-- 初始账号：admin / maxkey   （mxk_userinfo.password 为 {{plain}}maxkey）
 -- 上线前请立即：① 改 admin 密码  ② 把 mxk_institutions.domain 改成真实域名
 
-"""
+""".format(public_url=public_url)
 
     with open(DST, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write(header)
@@ -282,9 +382,11 @@ def main():
             print("种子 %-26s %s" % (tbl, "OK" if hit else "缺失!"))
             ok = ok and hit
 
-        # 演示应用与运行时数据必须一条都不剩
+        # 演示应用与运行时数据必须一条都不剩。
+        # 注意 mxk_apps / mxk_apps_cas_details / mxk_access 不在此列：
+        # 它们各自只剩管理端那一行，单独按精确行数断言（见下）。
         zero_expected = [
-            "mxk_apps", "mxk_apps_cas_details", "mxk_apps_oauth_client_details", "mxk_access",
+            "mxk_apps_oauth_client_details",
             "mxk_remember_me", "mxk_passkey_challenges", "mxk_user_passkeys",
             "mxk_history_login", "mxk_history_login_apps", "mxk_history_system_logs",
             "mxk_history_event", "mxk_connectors", "mxk_history_connector",
@@ -299,6 +401,26 @@ def main():
                 ok = False
         print("运行时/演示数据          %d 张表全部为 0 条  %s"
               % (len(zero_expected), "OK" if ok else "有残留"))
+
+        # 管理端应用：三张表各恰好 1 行，且地址指向现场对外地址
+        for t in ("mxk_apps", "mxk_apps_cas_details", "mxk_access"):
+            n = sum(1 for l in body.split("\n") if re.match(r"^INSERT INTO %s\b" % t, l))
+            print("管理端应用 %-22s %d 行  %s" % (t, n, "OK" if n == 1 else "应为 1"))
+            ok = ok and (n == 1)
+
+        # 三行必须都指向 public_url，且 CAS service 带 hash 路由。
+        # 注意这几条 INSERT 是多行写法，不能按单行匹配，直接在生成文本里找。
+        mgt_text = "\n".join(mgt_rows)
+        mgt_needles = [
+            MGT_APP_ID,
+            "%s/maxkey-mgt/" % public_url,
+            "%s/maxkey-mgt/#/passport/trust/auth" % public_url,
+            "ROLE_ADMINISTRATORS",
+        ]
+        for needle in mgt_needles:
+            hit = needle in mgt_text
+            print("  指向 %-42s %s" % (needle[-42:], "OK" if hit else "缺失!"))
+            ok = ok and hit
 
         # 只允许 1 个用户
         n_user = sum(1 for l in body.split("\n") if re.match(r"^INSERT INTO mxk_userinfo", l))
