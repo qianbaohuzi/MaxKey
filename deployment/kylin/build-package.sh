@@ -496,6 +496,42 @@ fetch_jar "org/flywaydb/flyway-database-postgresql/${FLYWAY_VER}/flyway-database
 fetch_jar "org/postgresql/postgresql/${PGJDBC_VER}/postgresql-${PGJDBC_VER}.jar"
 fetch_jar "com/google/code/gson/gson/${GSON_VER}/gson-${GSON_VER}.jar"
 
+# Flyway 12 用 Jackson **3**（包名 tools.jackson）解析配置，缺了会抛
+#   ClassNotFoundException: tools.jackson.databind.ObjectMapper
+# 报错位置在 Flyway 构造阶段，看起来像"Flyway 装坏了"。
+# 版本跟随项目 gradle.properties 的 jackson3Version，避免与仓库其它地方不一致。
+JACKSON3_VER=$(sed -n 's/^jackson3Version[[:space:]]*=[[:space:]]*//p' "${REPO}/gradle.properties" | head -1 | tr -d ' \r')
+: "${JACKSON3_VER:=3.0.4}"
+
+# 优先从本机 Gradle 缓存取（构建机通常已有，离线也能出包）；
+# 缓存里没有再联网下载。
+fetch_jar_local_first() {
+    # $1 = gradle 缓存 group 路径, $2 = 完整 maven 相对路径
+    local grp=$1 rel=$2 name
+    name=$(basename "$rel")
+    if [ -f "${MVN_CACHE}/${name}" ]; then
+        cp "${MVN_CACHE}/${name}" "${OUT}/sql/lib/"; echo "    缓存 ${name}"; return 0
+    fi
+    local hit
+    hit=$(find "${HOME}/.gradle/caches/modules-2/files-2.1/${grp}" -name "$name" 2>/dev/null | head -1)
+    if [ -n "$hit" ]; then
+        cp "$hit" "${OUT}/sql/lib/"
+        cp "$hit" "${MVN_CACHE}/" 2>/dev/null || true
+        echo "    Gradle 缓存 ${name}"
+        return 0
+    fi
+    fetch_jar "$rel"
+}
+
+fetch_jar_local_first "tools.jackson.core/jackson-databind" \
+    "tools/jackson/core/jackson-databind/${JACKSON3_VER}/jackson-databind-${JACKSON3_VER}.jar"
+fetch_jar_local_first "tools.jackson.core/jackson-core" \
+    "tools/jackson/core/jackson-core/${JACKSON3_VER}/jackson-core-${JACKSON3_VER}.jar"
+# annotations 在 Jackson 3 里仍沿用 com.fasterxml 坐标（2.x 版本号），
+# 但 3.x 的 databind 兼容它。取项目已用的 2.22。
+fetch_jar_local_first "com.fasterxml.jackson.core/jackson-annotations" \
+    "com/fasterxml/jackson/core/jackson-annotations/${JACKSON_ANN_VER:-2.22}/jackson-annotations-${JACKSON_ANN_VER:-2.22}.jar"
+
 # kingbase8 驱动复用仓库里的（与应用连库时用的是同一个 jar，行为一致）
 if [ -f "${REPO}/maxkey-lib/kingbase8-9.0.0.jar" ]; then
     cp "${REPO}/maxkey-lib/kingbase8-9.0.0.jar" "$OUT/sql/lib/"

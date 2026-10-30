@@ -186,7 +186,14 @@ conf_sync_missing_keys() {
         grep -qE "^[[:space:]]*${k}=" "$conf" && continue
         local def
         def=$(grep -E "^[[:space:]]*${k}=" "$tpl" | head -1 | sed "s/^[[:space:]]*${k}=//")
-        printf '\n# 新版本新增项（升级时补入，值取模板默认，请按现场核对）\n%s=%s\n' "$k" "$def" >> "$conf"
+        # dry-run 下不能真写：这函数由 upgrade.sh 在 dry-run 里也会调用，
+        # 裸 >> 会在"只演练"时把现场配置改掉 —— 演练反而造成变更，
+        # 是最不该发生的副作用。
+        if [ "${DRY_RUN:-0}" = "1" ]; then
+            printf '    [dry-run] 将补入配置项 %s=%s\n' "$k" "$def"
+        else
+            printf '\n# 新版本新增项（升级时补入，值取模板默认，请按现场核对）\n%s=%s\n' "$k" "$def" >> "$conf"
+        fi
         added="${added} ${k}"
     done
     [ -n "$added" ] && printf '%s' "$added"
@@ -383,7 +390,16 @@ health_check() {
     local lf line
     for lf in "${LOG_DIR}/portal/maxkey.log" "${LOG_DIR}/mgt/maxkey.log"; do
         [ -f "$lf" ] || continue
-        line=$(tail -n 400 "$lf" 2>/dev/null | grep -E ' ERROR ' | tail -3 || true)
+        # 已知的"非故障 ERROR"必须排除，否则每次健康检查都会带一条噪音。
+        # 反复出现的假告警会训练人忽略告警 —— 那比没有告警更危险。
+        #
+        # 目前只有一条：Druid 在 testWhileIdle=true 且未配 validationQuery 时
+        # 打出的配置提醒。它是 Druid 的既有行为（连接可用性检测退化为
+        # "连接没断就算健康"），不影响启动与功能，属于已知问题。
+        line=$(tail -n 400 "$lf" 2>/dev/null \
+                 | grep -E ' ERROR ' \
+                 | grep -v 'testWhileIdle is true, validationQuery not set' \
+                 | tail -3 || true)
         if [ -n "$line" ]; then
             warn "最近日志里有 ERROR（${lf}）:"
             printf '%s\n' "$line" | sed 's/^/      /'
