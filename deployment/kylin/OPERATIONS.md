@@ -160,6 +160,8 @@ cd /home/maxkey/release/maxkey-deploy-4.2.0-*
 | Kingbase 端口不可达 | 确认 Kingbase 服务在跑：`ss -lnt \| grep 54321` |
 | `/etc/maxkey/maxkey-secret.env` 缺失 | 正常，第 3.4 步会创建 |
 | nginx 未安装 | `yum install -y nginx`（目标机应已装，缺失时找运维） |
+| `AWT/字体不可用 ... Module jdk.compiler not in boot Layer` | **是旧版预检脚本的误报，不是缺东西**（java.desktop 一直都在，是探测方式错了）。换用 2026-10-30 之后的包，或手工验证：`«包内jre»/bin/java --list-modules \| grep java.desktop` |
+| `端口 9527/9526 已被占用` 且占用者是 java | 这台机器之前装过/还在跑 MaxKey。见 Q：全新机器不会出现；出现了按 §6 卸载后重装 |
 
 ### 3.1 创建证书（自签，仅测试环境）
 

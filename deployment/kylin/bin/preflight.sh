@@ -128,10 +128,19 @@ fi
 sec "4. Java 字体/图形（验证码依赖 java.desktop）"
 
 if [ -n "$JAVA_BIN" ]; then
-    if "$JAVA_BIN" -Djava.awt.headless=true -e 2>/dev/null; then :; fi
-    # 用最小代码验证 AWT 与字体是否可用
-    TMPJ=$(mktemp /tmp/AwtCheckXXXX.java)
-    cat > "$TMPJ" <<'EOF'
+    # 用最小代码验证 AWT 与字体是否可用。
+    #
+    # ⚠️ 实现注意：**不能用 `java Probe.java` 单文件源码模式**。
+    #   该模式要现场编译，依赖 jdk.compiler 模块；而 jlink 裁剪的运行时
+    #   按设计不含它，于是报
+    #       InternalError: Module jdk.compiler not in boot Layer
+    #   前面还会带一句误导性的 "A JNI error has occurred"。
+    #   看起来像"裁剪缺了东西"，实际 java.desktop 一直都在 ——
+    #   假告警会把人引去重装字体/重建运行时，方向完全错。
+    #   maxkeyctl.sh 的 runtime_selfcheck 早就为同一个坑写过同样的注释，
+    #   这里必须同样处理：**先用系统 javac 编译成 class，再让包内 jre 跑**。
+    PROBE_DIR=$(mktemp -d /tmp/awtchk.XXXXXX)
+    cat > "${PROBE_DIR}/AwtCheck.java" <<'EOF'
 public class AwtCheck {
     public static void main(String[] a) {
         int n = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
@@ -140,15 +149,53 @@ public class AwtCheck {
     }
 }
 EOF
-    OUT=$("$JAVA_BIN" -Djava.awt.headless=true "$TMPJ" 2>&1)
-    FONTS=$(echo "$OUT" | grep -oE 'FONTS=[0-9]+' | cut -d= -f2)
-    if [ -n "$FONTS" ] && [ "$FONTS" -gt 0 ] 2>/dev/null; then
-        ok "AWT 可用，字体族 ${FONTS} 个（验证码可正常渲染）"
+
+    JAVAC_BIN=""
+    for c in "$(command -v javac 2>/dev/null)" \
+             /usr/lib/jvm/java-21-openjdk-amd64/bin/javac \
+             /usr/lib/jvm/*21*/bin/javac; do
+        [ -n "$c" ] && [ -x "$c" ] && { JAVAC_BIN="$c"; break; }
+    done
+
+    OUT=""
+    if [ -n "$JAVAC_BIN" ]; then
+        if "$JAVAC_BIN" -d "$PROBE_DIR" "${PROBE_DIR}/AwtCheck.java" 2>/dev/null; then
+            OUT=$("$JAVA_BIN" -Djava.awt.headless=true -cp "$PROBE_DIR" AwtCheck 2>&1)
+        else
+            OUT="javac 编译失败"
+        fi
     else
-        err "AWT/字体不可用，验证码会失败。请安装字体: yum install fontconfig dejavu-sans-fonts"
-        echo "         $OUT" | head -3
+        # 目标机没有 javac（包内 jre 不含 jdk.compiler，系统也只有 JRE 时）
+        # 退化为模块存在性检查：java.desktop 在 + 字体目录非空，基本可判定可用
+        if "$JAVA_BIN" --list-modules 2>/dev/null | grep -q '^java.desktop'; then
+            NFONT=0
+            for d in /usr/share/fonts /usr/local/share/fonts ~/.fonts; do
+                [ -d "$d" ] && NFONT=$((NFONT + $(find "$d" -name '*.ttf' -o -name '*.otf' 2>/dev/null | wc -l)))
+            done
+            if [ "$NFONT" -gt 0 ]; then
+                ok "java.desktop 模块在，发现 ${NFONT} 个字体文件（验证码大概率正常；未做渲染实测）"
+            else
+                err "java.desktop 模块在，但系统未发现字体文件，验证码可能渲染失败"
+                echo "         安装字体: yum install fontconfig dejavu-sans-fonts"
+            fi
+            rm -rf "$PROBE_DIR"
+            JAVA_BIN=""   # 跳过下面的旧路径，避免重复检查
+        else
+            OUT="Module java.desktop not in boot Layer（运行时确实缺模块）"
+        fi
     fi
-    rm -f "$TMPJ" /tmp/AwtCheck.class 2>/dev/null
+
+    if [ -n "$JAVA_BIN" ]; then
+        FONTS=$(echo "$OUT" | grep -oE 'FONTS=[0-9]+' | cut -d= -f2)
+        if [ -n "$FONTS" ] && [ "$FONTS" -gt 0 ] 2>/dev/null; then
+            ok "AWT 可用，字体族 ${FONTS} 个（验证码可正常渲染）"
+        else
+            err "AWT/字体不可用，验证码会失败。请安装字体: yum install fontconfig dejavu-sans-fonts"
+            echo "         $OUT" | head -3
+            echo "         若报 Module jdk.compiler not in boot Layer，是探测方式问题，不是缺字体"
+        fi
+    fi
+    rm -rf "$PROBE_DIR" 2>/dev/null
 fi
 
 # ----------------------------------------------------------- 5. 配置 ----
