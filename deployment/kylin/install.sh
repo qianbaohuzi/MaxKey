@@ -42,6 +42,20 @@
 set -eu
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# 系统管理命令（useradd / nginx / firewall-cmd 等）在 /usr/sbin 与 /sbin，
+# 普通用户或非登录 shell 的 PATH 通常不含它们。root 的 PATH 一般没问题，
+# 但 `sudo -i` 之外的调用方式（如 sudo ./install.sh --dry-run）会缺。
+# 补进 PATH，避免把"检查方式错"报成"缺组件"。
+case ":${PATH}:" in
+    *:/usr/sbin:*) ;;
+    *) PATH="${PATH}:/usr/sbin" ;;
+esac
+case ":${PATH}:" in
+    *:/sbin:*) ;;
+    *) PATH="${PATH}:/sbin" ;;
+esac
+export PATH
 # shellcheck source=lib/common.sh
 . "${HERE}/lib/common.sh"
 
@@ -558,6 +572,23 @@ else
     skip "已指定 --no-nginx，跳过 nginx 接入"
 fi
 
+# ------------------------------------------------------------ 防火墙 ----
+# 必须在 nginx 之后检查：这里要提示的是"外部能不能连进来"，
+# 而 nginx 起没起来是另一件事（已在上一步验证）。
+# 不自动放行，只给命令 —— 改防火墙是运维决策，等保环境下尤其如此。
+if [ "$DO_NGINX" = "1" ]; then
+    say "防火墙"
+    if ! systemctl is-active firewalld >/dev/null 2>&1; then
+        info "firewalld 未运行，跳过"
+    elif check_firewall_port "${NGINX_TLS_PORT:-443}"; then
+        info "端口 ${NGINX_TLS_PORT:-443}/tcp 已放行"
+    else
+        warn "端口 ${NGINX_TLS_PORT:-443}/tcp 未放行 —— 外部浏览器将无法访问"
+        firewall_hint "${NGINX_TLS_PORT:-443}"
+        FW_BLOCKED=1
+    fi
+fi
+
 # ---------------------------------------------------------------- 建库 ----
 if [ "$DO_DB" = "1" ]; then
     say "初始化数据库"
@@ -731,3 +762,8 @@ cat <<EOF
     1. 浏览器打开 ${MAXKEY_PUBLIC_URL}/maxkey/ ，admin/maxkey 登录后立即改密
     2. 管理端「机构」的 domain 改成 ${NGINX_SERVER_NAME}
 EOF
+
+if [ "${FW_BLOCKED:-0}" = "1" ]; then
+    printf '\n\033[1;33m  ⚠ 防火墙未放行 %s/tcp —— 本机 curl 会返回 200，但外部浏览器打不开。\033[0m\n' "${NGINX_TLS_PORT:-443}"
+    printf '    firewall-cmd --permanent --add-port=%s/tcp && firewall-cmd --reload\n' "${NGINX_TLS_PORT:-443}"
+fi

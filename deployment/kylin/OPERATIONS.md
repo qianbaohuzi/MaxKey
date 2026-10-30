@@ -162,6 +162,7 @@ cd /home/maxkey/release/maxkey-deploy-4.2.0-*
 | nginx 未安装 | `yum install -y nginx`（目标机应已装，缺失时找运维） |
 | `AWT/字体不可用 ... Module jdk.compiler not in boot Layer` | **是旧版预检脚本的误报，不是缺东西**（java.desktop 一直都在，是探测方式错了）。换用 2026-10-30 之后的包，或手工验证：`«包内jre»/bin/java --list-modules \| grep java.desktop` |
 | `端口 9527/9526 已被占用` 且占用者是 java | 这台机器之前装过/还在跑 MaxKey。见 Q：全新机器不会出现；出现了按 §6 卸载后重装 |
+| `firewalld 未放行 9443/tcp` | **必须处理，否则外部浏览器打不开**（本机 curl 仍返回 200，极具迷惑性）。放行命令见该条输出的提示 |
 
 ### 3.1 创建证书（自签，仅测试环境）
 
@@ -268,6 +269,45 @@ grep -cE '^(DATABASE_PWD|JWT_SECRET)=' /etc/maxkey/maxkey-secret.env
 预期最后一行：`== 验证通过：安装完整 ==`。
 
 任何 `[FAIL]` 项按提示处理后再验一次，**这一步不过不要进入点测**。
+
+---
+
+### 3.6 放行防火墙端口（这一步容易漏，漏了浏览器打不开）
+
+`install.sh` 会检查但**不会自动改防火墙**（改防火墙是运维决策）。
+若输出里出现 `未放行 9443/tcp`，执行：
+
+```bash
+# root 下
+firewall-cmd --permanent --add-port=9443/tcp
+firewall-cmd --reload
+firewall-cmd --list-ports
+#      预期输出里包含 9443/tcp
+```
+
+> **为什么这一步特别容易漏**：没放行时，在服务器上
+> `curl -k https://127.0.0.1:9443/maxkey/` **仍然返回 200** ——
+> 因为 iptables 有 `-A INPUT -i lo -j ACCEPT`，回环流量被放行。
+> 只有从**别的机器**访问才会失败。所以"服务器自测通过"不能证明外部可访问。
+>
+> qilin-01 的实际配置（示例）：
+> ```
+> services: cockpit dhcpv6-client http https mdns ssh
+> ports:    9999/tcp 54321/tcp 9092/tcp 8093/tcp
+> ```
+> 443 因 `services` 里有 `https` 而放行，但 MaxKey 用的是 **9443**，
+> 不在白名单里，命中末尾的 `REJECT --reject-with icmp-host-prohibited`。
+
+验证（从**另一台机器**，不是服务器本机）：
+
+```bash
+# 在开发机
+timeout 5 bash -c 'exec 3<>/dev/tcp/«QILIN01_IP»/9443' && echo "9443 可达"
+curl -sk -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: sso.maxkey.lottery-dev.com' \
+  https://«QILIN01_IP»:9443/maxkey/
+#      预期 200
+```
 
 ---
 

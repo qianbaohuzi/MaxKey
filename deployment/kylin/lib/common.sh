@@ -445,6 +445,65 @@ require_soft() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# ------------------------------------------------------------ 防火墙检查 ----
+# 目标机开了 firewalld 时，端口没放行 → 本机 curl 200、外部浏览器打不开。
+# 这个坑极难自查：应用正常、nginx 正常、端口在监听，`curl 127.0.0.1` 也是 200，
+# 因为回环接口被 iptables 的 `-A INPUT -i lo -j ACCEPT` 放行了 ——
+# 也就是说"本机自测全绿"完全无法证明外部可访问。
+#
+# 实测过的现场（qilin-01）：
+#   services: cockpit dhcpv6-client http https mdns ssh
+#   ports:    9999/tcp 54321/tcp 9092/tcp 8093/tcp
+#   → 443 因为 services 里有 https 而放行，但 MaxKey 用 9443，
+#     没在白名单里，命中最后的 `REJECT --reject-with icmp-host-prohibited`。
+#
+# 这里只做**检查与提示**，不自动改防火墙：放行端口是运维决策，
+# 擅自修改防火墙在等保/信创环境里可能直接违反合规要求。
+# 返回 0 = 已放行或无需检查；1 = 未放行
+check_firewall_port() {
+    local port=$1
+    local zone
+
+    # firewalld 未运行 → 没有这个问题（也可能是 iptables 手写规则，不深究）
+    if ! systemctl is-active firewalld >/dev/null 2>&1; then
+        return 0
+    fi
+
+    zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
+
+    # 已显式放行端口
+    if firewall-cmd --zone="$zone" --query-port="${port}/tcp" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 端口所属服务已放行（如 443 对应 https、80 对应 http）
+    case "$port" in
+        443) firewall-cmd --zone="$zone" --query-service=https >/dev/null 2>&1 && return 0 ;;
+        80)  firewall-cmd --zone="$zone" --query-service=http  >/dev/null 2>&1 && return 0 ;;
+    esac
+
+    return 1
+}
+
+# 打印"怎么放行"，措辞里带上后果，避免被当成可选建议忽略
+firewall_hint() {
+    local port=$1
+    cat <<EOF
+
+    firewalld 正在运行，但端口 ${port}/tcp 未放行。
+    表现：服务器本机 curl 返回 200，但**别的机器上的浏览器打不开**
+          （回环接口被 iptables 放行，所以本机自测看不出问题）。
+
+    放行命令（root）：
+        firewall-cmd --permanent --add-port=${port}/tcp
+        firewall-cmd --reload
+        firewall-cmd --list-ports          # 确认出现 ${port}/tcp
+
+    只想临时验证（重启后失效）：
+        firewall-cmd --add-port=${port}/tcp
+EOF
+}
+
 # ------------------------------------------------------------ 版本比较 ----
 # 版本形如 4.2.0-<sha>-<时间戳>，比较时只看第一段的数字部分；
 # 其余部分用于目录命名与溯源。相同数字版本视为"同级升级"（允许）。

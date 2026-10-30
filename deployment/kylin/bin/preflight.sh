@@ -38,6 +38,20 @@ else
 fi
 SECRET_FILE=/etc/maxkey/maxkey-secret.env
 
+# 系统管理命令（useradd / nginx / firewall-cmd 等）装在 /usr/sbin 与 /sbin，
+# 而普通用户或非登录 shell 的 PATH 通常**不含**它们，于是 `command -v nginx`
+# 找不到 —— 报"未安装 nginx"，其实装得好好的。
+# 这是"检查方式错"而非"缺组件"，先把这两个目录补进 PATH 再检测。
+case ":${PATH}:" in
+    *:/usr/sbin:*) ;;
+    *) PATH="${PATH}:/usr/sbin" ;;
+esac
+case ":${PATH}:" in
+    *:/sbin:*) ;;
+    *) PATH="${PATH}:/sbin" ;;
+esac
+export PATH
+
 PASS=0; WARN=0; FAIL=0
 ok()   { printf '  \033[32m[ OK ]\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 warn() { printf '  \033[33m[WARN]\033[0m %s\n' "$*"; WARN=$((WARN+1)); }
@@ -316,8 +330,45 @@ if command -v nginx >/dev/null 2>&1; then
     if command -v semanage >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
         warn "SELinux 为 Enforcing，nginx 反代可能被拒绝，需: setsebool -P httpd_can_network_connect 1"
     fi
+    # 防火墙：必须按**实际使用的端口**检查，不能笼统说"放行 80/443"。
+    # 踩过的坑（qilin-01 真实事故）：现场 services 里有 https，
+    # 于是 443 是放行的，但 MaxKey 配的是 9443 —— 不在白名单里，
+    # 命中 iptables 末尾的 `REJECT --reject-with icmp-host-prohibited`。
+    # 表现极具迷惑性：服务器本机 curl 返回 200（回环接口被放行），
+    # 外部浏览器却打不开，很容易误判成"证书/域名/应用"问题。
+    # 防火墙：必须按**实际使用的端口**检查，不能笼统说"放行 80/443"。
+    # 踩过的坑（qilin-01 真实事故）：现场 services 里有 https，
+    # 于是 443 是放行的，但 MaxKey 配的是 9443 —— 不在白名单里，
+    # 命中 iptables 末尾的 `REJECT --reject-with icmp-host-prohibited`。
+    # 表现极具迷惑性：服务器本机 curl 返回 200（回环接口被放行），
+    # 外部浏览器却打不开，很容易误判成"证书/域名/应用"问题。
+    #
+    # 注意：本脚本不 source lib/common.sh —— 它有自己的 ok/warn/err，
+    # 两者函数名冲突。所以这里内联实现同一判断，逻辑与
+    # common.sh 的 check_firewall_port 保持一致。
     if systemctl is-active firewalld >/dev/null 2>&1; then
-        warn "firewalld 运行中，需放行 80/443: firewall-cmd --add-service=http --permanent"
+        FW_PORT="${NGINX_TLS_PORT:-443}"
+        FW_ZONE=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
+        FW_OK=0
+        firewall-cmd --zone="$FW_ZONE" --query-port="${FW_PORT}/tcp" >/dev/null 2>&1 && FW_OK=1
+        if [ "$FW_OK" = "0" ]; then
+            case "$FW_PORT" in
+                443) firewall-cmd --zone="$FW_ZONE" --query-service=https >/dev/null 2>&1 && FW_OK=1 ;;
+                80)  firewall-cmd --zone="$FW_ZONE" --query-service=http  >/dev/null 2>&1 && FW_OK=1 ;;
+            esac
+        fi
+        if [ "$FW_OK" = "1" ]; then
+            ok "firewalld 已放行 ${FW_PORT}/tcp"
+        else
+            err "firewalld 未放行 ${FW_PORT}/tcp —— 外部浏览器将无法访问"
+            echo "         注意：本机 curl 仍会返回 200（回环接口被放行），别被误导"
+            echo "         放行命令（root）:"
+            echo "           firewall-cmd --permanent --add-port=${FW_PORT}/tcp"
+            echo "           firewall-cmd --reload"
+            echo "           firewall-cmd --list-ports      # 确认出现 ${FW_PORT}/tcp"
+        fi
+    else
+        ok "firewalld 未运行（无需检查端口放行）"
     fi
 else
     err "未安装 nginx，前端无法访问（yum install nginx 或 dnf install nginx）"
